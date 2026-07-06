@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf" content="{{ csrf }}">
+  <title>{{ app_name }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body
+  data-default-allowed="{{ default_allowed_ips }}"
+  data-presets="{{ presets | tojson | forceescape }}"
+  data-smtp="{{ '1' if smtp_enabled else '' }}"
+  data-link-ttl="{{ link_ttl_minutes }}"
+  data-twofa="{{ '1' if twofa_enabled else '' }}"
+  data-twofa-available="{{ '1' if twofa_available else '' }}">
+  <header class="topbar">
+    <div><strong>{{ app_name }}</strong></div>
+    <div class="row" style="align-items:center; gap:.5rem;">
+      <button id="twofa-btn" class="ghost hidden" type="button">2FA</button>
+      <button id="pw-btn" class="ghost" type="button">Change password</button>
+      <button id="theme-btn" class="ghost" type="button" title="Toggle light/dark">◐</button>
+      <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
+    </div>
+  </header>
+  <div id="toasts" class="toasts"></div>
+
+  <div id="edit-modal" class="modal hidden">
+    <form id="edit-form" class="card modal-card">
+      <h2>Edit peer</h2>
+      <label>Name
+        <input id="edit-name" required>
+      </label>
+      <div>
+        <span class="muted small">Routed subnets (pfSense AllowedIPs, beyond the tunnel /32)</span>
+        <div id="edit-subnets"></div>
+        <button type="button" id="edit-add-subnet" class="ghost small">+ Add subnet</button>
+      </div>
+      <label class="row" style="align-items:center; gap:.5rem;">
+        <input type="checkbox" id="edit-change-expiry" style="width:auto">
+        <span>Change expiry</span>
+      </label>
+      <label>Expires in (days, 0 = never)
+        <input id="edit-expiry" type="number" min="0" max="3650" value="0" style="width:8rem" disabled>
+      </label>
+      <p id="edit-msg" class="msg"></p>
+      <div class="row">
+        <button type="submit">Save changes</button>
+        <button type="button" id="edit-cancel" class="ghost">Cancel</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="pw-modal" class="modal hidden">
+    <form id="pw-form" class="card modal-card">
+      <h2>Change password</h2>
+      <label>Current password
+        <input id="pw-current" type="password" autocomplete="current-password" required>
+      </label>
+      <label>New password <span class="muted">(min 8 chars)</span>
+        <input id="pw-new" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <label>Confirm new password
+        <input id="pw-confirm" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <p id="pw-msg" class="msg"></p>
+      <div class="row">
+        <button type="submit">Update password</button>
+        <button type="button" id="pw-cancel" class="ghost">Cancel</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="twofa-modal" class="modal hidden">
+    <div class="card modal-card">
+      <h2>Two-factor authentication</h2>
+
+      <!-- Shown when 2FA is currently OFF -->
+      <div id="twofa-off">
+        <p class="muted">
+          Add a time-based one-time code (TOTP) on top of your password.
+          Works with Google Authenticator, Aegis, 1Password, etc.
+        </p>
+        <div id="twofa-setup" class="hidden">
+          <p class="muted small">1. Scan this QR (or enter the key) in your authenticator app:</p>
+          <div id="twofa-qr" class="qr"></div>
+          <p class="small">Setup key: <code id="twofa-secret">—</code></p>
+          <label>2. Enter the 6-digit code to confirm
+            <input id="twofa-enable-code" inputmode="numeric" autocomplete="one-time-code"
+                   pattern="[0-9]*" placeholder="123456" maxlength="6" style="width:8rem">
+          </label>
+        </div>
+        <p id="twofa-off-msg" class="msg"></p>
+        <div class="row">
+          <button id="twofa-start-btn" type="button">Start setup</button>
+          <button id="twofa-enable-btn" type="button" class="hidden">Enable 2FA</button>
+          <button id="twofa-off-cancel" type="button" class="ghost">Close</button>
+        </div>
+      </div>
+
+      <!-- Shown when 2FA is currently ON -->
+      <div id="twofa-on" class="hidden">
+        <p class="ok-text">✔ Two-factor authentication is <strong>enabled</strong>.</p>
+        <label>Enter a current code to turn it off
+          <input id="twofa-disable-code" inputmode="numeric" autocomplete="one-time-code"
+                 pattern="[0-9]*" placeholder="123456" maxlength="6" style="width:8rem">
+        </label>
+        <p id="twofa-on-msg" class="msg"></p>
+        <div class="row">
+          <button id="twofa-disable-btn" type="button" class="danger">Disable 2FA</button>
+          <button id="twofa-on-cancel" type="button" class="ghost">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <main>
+    <!-- Tunnel panel -->
+    <section class="card tunnel-card">
+      <div class="tunnel-grid">
+        <div><span class="k">Tunnel</span><span id="t-name" class="v">{{ tunnel }}</span></div>
+        <div><span class="k">Endpoint</span><span class="v">{{ endpoint }}</span></div>
+        <div><span class="k">Listen port</span><span id="t-port" class="v">—</span></div>
+        <div><span class="k">Pool usage</span><span id="t-pool" class="v">{{ pool }}</span></div>
+        <div><span class="k">Peers</span><span id="t-count" class="v">—</span></div>
+        <div><span class="k">Online now</span><span id="t-online" class="v">—</span></div>
+        <div><span class="k">Apply</span><span id="apply-status" class="v">—</span></div>
+      </div>
+      <div class="server-key"><span class="k">Server public key</span> <code id="t-pubkey">—</code></div>
+    </section>
+
+    <!-- Add device -->
+    <section class="card">
+      <h2>Add device</h2>
+      <p class="muted">
+        The keypair is generated <strong>in your browser</strong>; the private key is
+        shown once and never sent to the server. This app assigns the next free IP in
+        the pool — <strong>firewall/access rules are yours to set in pfSense</strong>.
+      </p>
+      <form id="add-form">
+        <div class="row">
+          <label class="grow">Device name <span class="muted">(pfSense peer description)</span>
+            <input id="dev-name" placeholder="e.g. Laptop" required>
+          </label>
+          <label class="grow">Client AllowedIPs <span class="muted">(routing, not ACL)</span>
+            <input id="dev-aips" list="aips-presets" placeholder="0.0.0.0/0">
+            <datalist id="aips-presets"></datalist>
+          </label>
+          <label>Expires <span class="muted">(days, 0 = never)</span>
+            <input id="dev-expiry" type="number" min="0" max="3650" value="0" style="width:7rem">
+          </label>
+          <button id="add-btn" type="submit">Generate &amp; add</button>
+        </div>
+        <details class="subnets-wrap">
+          <summary>Extra routed subnets on pfSense (peer AllowedIPs) — optional</summary>
+          <p class="muted small">
+            The tunnel /32 is assigned automatically. Add subnets that live
+            <em>behind</em> this peer (e.g. a site/VM LAN), each with its own description.
+          </p>
+          <div id="subnets"></div>
+          <button type="button" id="add-subnet-btn" class="ghost small">+ Add subnet</button>
+        </details>
+      </form>
+      <p id="add-msg" class="msg"></p>
+    </section>
+
+    <!-- Result -->
+    <section id="result" class="card hidden">
+      <h2>Config for <span id="r-name"></span></h2>
+      <p class="warn">⚠ This private key is shown once and is <strong>not stored</strong>. Save the file or scan the QR now.</p>
+      <div class="result-grid">
+        <div><div id="qr" class="qr"></div></div>
+        <div class="grow">
+          <pre id="conf-text" class="conf"></pre>
+          <div class="row actions-row">
+            <button id="download-btn" type="button">Download .conf</button>
+            <button id="copy-btn" class="ghost" type="button">Copy</button>
+            <button id="print-btn" class="ghost" type="button">Print</button>
+            <button id="qrpng-btn" class="ghost" type="button">Save QR (PNG)</button>
+            <button id="share-btn" class="ghost hidden" type="button">Share…</button>
+            <button id="email-btn" class="ghost hidden" type="button">Email…</button>
+            <button id="link-btn" class="ghost" type="button">One-time link</button>
+            <button id="done-btn" class="ghost" type="button">Done</button>
+          </div>
+          <div id="link-out" class="link-out hidden"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Peers -->
+    <section class="card">
+      <div class="row between">
+        <h2>Peers</h2>
+        <div class="row" style="gap:.5rem; align-items:center;">
+          <input id="search" placeholder="Search name / IP…" style="width:12rem">
+          <button id="import-all-btn" class="ghost small" type="button">Import all unmanaged</button>
+          <button id="export-csv-btn" class="ghost small" type="button">Export CSV</button>
+          <button id="export-json-btn" class="ghost small" type="button">Export JSON</button>
+          <span id="counts" class="muted"></span>
+        </div>
+      </div>
+      <div id="list-msg" class="msg"></div>
+      <table class="devices">
+        <thead>
+          <tr><th>Name</th><th>Peer IP</th><th>AllowedIPs</th><th>Public key</th><th>Source</th><th>State</th><th>Activity</th><th>Expires</th><th></th></tr>
+        </thead>
+        <tbody id="dev-rows"></tbody>
+      </table>
+      <p class="muted small">
+        “Imported” peers were already on pfSense and adopted into the registry.
+        “Unmanaged” peers exist on pfSense but aren’t tracked here yet — import to name/track them.
+      </p>
+    </section>
+
+    <!-- Activity -->
+    <section class="card">
+      <h2>Activity</h2>
+      <table class="audit"><tbody id="audit-rows"></tbody></table>
+    </section>
+  </main>
+
+  <script src="/static/nacl.min.js"></script>
+  <script src="/static/qrcode.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

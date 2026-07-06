@@ -1,0 +1,25 @@
+# Secrets & local config
+.env
+*.env.local
+
+# Runtime data / state (never commit)
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.hash
+totp.json
+setup.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

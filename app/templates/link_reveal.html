@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your WireGuard configuration</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <section class="card" data-filename="{{ filename }}">
+      <h2>Your WireGuard configuration</h2>
+      <p class="warn">
+        ⚠ This is shown once and the link is now used up. Save the file or scan the QR now.
+        It contains a private key — keep it secret.
+      </p>
+      <div class="result-grid">
+        <div><div id="qr" class="qr"></div></div>
+        <div class="grow">
+          <pre id="conf" class="conf">{{ config }}</pre>
+          <div class="row">
+            <button id="download-btn" type="button">Download .conf</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="/static/qrcode.js"></script>
+  <script src="/static/reveal.js"></script>
+</body>
+</html>

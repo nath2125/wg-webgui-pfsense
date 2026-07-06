@@ -1,0 +1,15 @@
+services:
+  wg-onboard:
+    build: .
+    image: pfsense-wg-onboard:latest
+    container_name: pfsense-wg-onboard
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bind to loopback only; front it with your own HTTPS reverse proxy + IP allowlist.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - wg_onboard_data:/data
+
+volumes:
+  wg_onboard_data:

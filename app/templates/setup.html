@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf" content="{{ csrf }}">
+  <title>Setup — {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-endpoint-host="{{ d_endpoint_host }}">
+  <header class="topbar">
+    <div><strong>{{ app_name }}</strong> · Setup</div>
+    <div class="row" style="align-items:center; gap:.5rem;">
+      {% if configured %}<a class="ghost" href="/">← Dashboard</a>{% endif %}
+      <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
+    </div>
+  </header>
+
+  <main style="max-width:720px; margin:1.5rem auto;">
+    <section class="card">
+      <h2>Connect to your pfSense</h2>
+      <p class="muted">
+        Point this app at your pfSense box's <strong>REST API</strong>
+        (jaredhendrickson13/pfSense-pkg-RESTAPI v2), pick your WireGuard tunnel, and
+        import the peers you already have. Nothing is created on pfSense — this only reads
+        your tunnel and (later) manages peers.
+      </p>
+
+      {% if env_locked %}
+      <p class="warn">This instance is configured via <strong>environment variables</strong>,
+        so the wizard is read-only here. Edit your <code>.env</code> to change the connection.</p>
+      {% elif not setup_available %}
+      <p class="warn">Onboarding needs a writable <code>SETUP_FILE</code>. Set it in your
+        environment (e.g. <code>SETUP_FILE=/data/setup.json</code>) and restart.</p>
+      {% endif %}
+
+      <fieldset id="wiz" {% if env_locked or not setup_available %}disabled{% endif %}
+                style="border:0; padding:0; margin:0;">
+        <!-- Step 1: connection -->
+        <h3>1 · pfSense API</h3>
+        <label>pfSense base URL
+          <input id="s-url" placeholder="https://192.168.1.1" value="{{ d_url }}">
+        </label>
+        <label>API key <span class="muted">(X-API-Key)</span>
+          <input id="s-key" type="password" autocomplete="off" placeholder="paste your API key">
+        </label>
+        <label class="row" style="align-items:center; gap:.5rem;">
+          <input type="checkbox" id="s-verify" style="width:auto">
+          <span>Verify the pfSense TLS certificate (off for self-signed)</span>
+        </label>
+        <div class="row">
+          <button id="s-test" type="button">Test connection</button>
+        </div>
+        <p id="s-msg" class="msg"></p>
+
+        <!-- Step 2: tunnel + endpoint (revealed after a successful test) -->
+        <div id="step2" class="hidden">
+          <h3>2 · Tunnel &amp; endpoint</h3>
+          <label>WireGuard tunnel
+            <select id="s-tunnel"></select>
+          </label>
+          <label>Public endpoint host <span class="muted">(what clients dial — DDNS/IP)</span>
+            <input id="s-endpoint" placeholder="vpn.example.com" value="{{ d_endpoint_host }}">
+          </label>
+          <div class="row">
+            <label>Listen port
+              <input id="s-port" type="number" min="1" max="65535" value="{{ d_endpoint_port }}" style="width:8rem">
+            </label>
+            <label class="grow">IP pool (CIDR the app hands /32s from)
+              <input id="s-pool" value="{{ d_pool }}">
+            </label>
+          </div>
+          <label>Default client AllowedIPs <span class="muted">(routing, not ACL)</span>
+            <input id="s-allowed" value="{{ d_allowed }}">
+          </label>
+          <div class="row">
+            <button id="s-save" type="button">Save &amp; connect</button>
+          </div>
+          <p id="s-save-msg" class="msg"></p>
+        </div>
+
+        <!-- Step 3: import (revealed after save) -->
+        <div id="step3" class="hidden">
+          <h3>3 · Import existing peers</h3>
+          <p class="ok-text">✔ Connected. <span id="s-pubkey-note"></span></p>
+          <p class="muted">Adopt the WireGuard peers already on this tunnel into the app so you
+            can name, track, and manage them. This does not change anything on pfSense.</p>
+          <div class="row">
+            <button id="s-import" type="button">Import existing peers</button>
+            <a id="s-finish" class="ghost" href="/">Skip to dashboard</a>
+          </div>
+          <p id="s-import-msg" class="msg"></p>
+        </div>
+      </fieldset>
+    </section>
+  </main>
+
+  <script src="/static/setup.js"></script>
+</body>
+</html>

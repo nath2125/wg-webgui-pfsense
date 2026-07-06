@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WireGuard configuration</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <form class="card login-card" method="post" action="/c/{{ token }}/reveal">
+    <h1>WireGuard configuration</h1>
+    <p class="muted">
+      Someone shared a WireGuard tunnel configuration with you. It can be viewed
+      <strong>once</strong> — after you reveal it, this link stops working.
+    </p>
+    <p class="warn">It contains a private key. Keep it secret.</p>
+    <button type="submit">Reveal configuration</button>
+  </form>
+</body>
+</html>
