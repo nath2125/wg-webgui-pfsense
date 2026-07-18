@@ -870,9 +870,9 @@ async def add_device(
         audit(session, request.session["user"], "add", target=payload.name, detail=detail)
 
     apply_mgr(request).request()
-    cfg = _config_context(request, device.name, device.assigned_ip, allowed_ips)
+    config_ctx = _config_context(request, device.name, device.assigned_ip, allowed_ips)
     return {"device": {"id": device.id, "name": device.name, "assigned_ip": device.assigned_ip},
-            "config": cfg.model_dump()}
+            "config": config_ctx.model_dump()}
 
 
 @app.post("/api/devices/import")
@@ -1114,8 +1114,8 @@ async def rotate_device(
     apply_mgr(request).request()
 
     allowed_ips = dev.client_allowed_ips.split(", ") if dev.client_allowed_ips else cfg(request).default_allowed_ips
-    cfg = _config_context(request, dev.name, dev.assigned_ip, allowed_ips)
-    return {"ok": True, "config": cfg.model_dump()}
+    config_ctx = _config_context(request, dev.name, dev.assigned_ip, allowed_ips)
+    return {"ok": True, "config": config_ctx.model_dump()}
 
 
 # --------------------------------------------------------------------------- #
