@@ -5,6 +5,7 @@
 const $ = (id) => document.getElementById(id);
 const CSRF = document.querySelector('meta[name="csrf"]').content;
 const DEFAULT_AIPS = document.body.dataset.defaultAllowed || "0.0.0.0/0";
+const DEFAULT_KEEPALIVE = parseInt(document.body.dataset.defaultKeepalive, 10) || 25;
 let PRESETS = [];
 try { PRESETS = JSON.parse(document.body.dataset.presets || "[]"); } catch (e) { PRESETS = []; }
 
@@ -123,6 +124,7 @@ async function onAdd(ev) {
   const name = $("dev-name").value.trim();
   const aips = $("dev-aips").value.trim();
   const expiry = parseInt($("dev-expiry").value, 10) || 0;
+  const ka = $("dev-keepalive").value.trim();
   const extra = collectSubnets("subnets");
   const msg = $("add-msg"), btn = $("add-btn");
   if (!name) return;
@@ -132,7 +134,11 @@ async function onAdd(ev) {
     const kp = generateKeypair();
     const result = await api("/api/devices", {
       method: "POST",
-      body: JSON.stringify({ name, public_key: kp.pub, client_allowed_ips: aips, expires_days: expiry, extra_allowed_ips: extra }),
+      body: JSON.stringify({
+        name, public_key: kp.pub, client_allowed_ips: aips, expires_days: expiry,
+        extra_allowed_ips: extra,
+        persistent_keepalive: ka === "" ? null : parseInt(ka, 10),
+      }),
     });
     msg.className = "msg ok";
     msg.textContent = "Added " + result.device.name + " → " + result.device.assigned_ip + ".";
@@ -285,6 +291,15 @@ function expiryText(r) {
   return '<span class="' + (days <= 3 ? "badge warn" : "muted") + '">' + days + 'd</span>';
 }
 
+function keepaliveCell(r) {
+  if (!r.present) return '<span class="muted">—</span>';
+  const ka = r.persistent_keepalive;
+  // No keepalive means the peer can't re-establish on its own after a tunnel
+  // apply, so call it out rather than showing a bare dash.
+  if (ka === null || ka === undefined || ka === 0) return '<span class="badge warn">off</span>';
+  return '<span class="muted">' + ka + 's</span>';
+}
+
 function renderRows() {
   const q = ($("search").value || "").toLowerCase().trim();
   const tbody = $("dev-rows"); tbody.innerHTML = "";
@@ -304,6 +319,7 @@ function renderRows() {
       "<td><code>" + escapeHtml(r.public_key_short) + "</code></td>" +
       "<td>" + sourceBadge(r) + "</td>" +
       "<td>" + stateBadge(r) + "</td>" +
+      "<td>" + keepaliveCell(r) + "</td>" +
       "<td>" + activityCell(r) + "</td>" +
       "<td>" + expiryText(r) + "</td>" +
       "<td class='actions'></td>";
@@ -365,10 +381,11 @@ function rowRouted(r) {
   return (r.allowed_ips || []).slice(1).map((a) => a.address + "/" + a.mask + (a.descr ? " (" + a.descr + ")" : "")).join("; ");
 }
 function exportCsv() {
-  const cols = ["name", "peer_ip", "routed_subnets", "public_key", "source", "state", "created_at", "expires_at"];
+  const cols = ["name", "peer_ip", "routed_subnets", "public_key", "source", "state", "keepalive", "created_at", "expires_at"];
   const lines = [cols.join(",")];
   LAST_PEERS.forEach((r) => {
     lines.push([r.name, rowPeerIp(r), rowRouted(r), r.public_key, rowSource(r), rowState(r),
+      r.persistent_keepalive == null ? "" : r.persistent_keepalive,
       r.created_at || "", r.expires_at || ""].map(csvEsc).join(","));
   });
   downloadText(lines.join("\n"), "wg-peers-" + dateStamp() + ".csv", "text/csv");
@@ -378,6 +395,7 @@ function exportJson() {
   const data = LAST_PEERS.map((r) => ({
     name: r.name, peer_ip: rowPeerIp(r), allowed_ips: r.allowed_ips || [],
     public_key: r.public_key, source: rowSource(r), state: rowState(r),
+    persistent_keepalive: r.persistent_keepalive,
     created_at: r.created_at, expires_at: r.expires_at,
   }));
   downloadText(JSON.stringify(data, null, 2), "wg-peers-" + dateStamp() + ".json", "application/json");
@@ -412,6 +430,26 @@ async function onImportAll() {
   try { const res = await api("/api/devices/import_all", { method: "POST", body: "{}" });
     toast(res.imported ? ("Imported " + res.imported + " peer(s)") : "Nothing to import", "ok"); await refresh(); }
   catch (e) { toast("Import-all failed: " + e.message, "err"); }
+}
+async function onKeepaliveAll() {
+  const missing = LAST_PEERS.filter((r) => r.present && !r.persistent_keepalive).length;
+  if (!missing) { toast("Every peer already has keepalive set", "ok"); return; }
+  const raw = prompt(
+    missing + " peer(s) have no keepalive. Set PersistentKeepalive (seconds) on them?\n\n" +
+    "This changes the pfSense side only — clients still need it in their own .conf.\n" +
+    "Applying will briefly bounce the tunnel.",
+    String(DEFAULT_KEEPALIVE));
+  if (raw === null) return;
+  const secs = parseInt(raw, 10);
+  if (isNaN(secs) || secs < 0 || secs > 65535) { toast("Enter 0-65535 seconds", "err"); return; }
+  try {
+    const res = await api("/api/devices/keepalive_all", { method: "POST",
+      body: JSON.stringify({ persistent_keepalive: secs, only_missing: true }) });
+    toast("Keepalive set on " + res.updated + " peer(s)" +
+      (res.skipped ? ", " + res.skipped + " skipped" : ""), res.errors.length ? "err" : "ok");
+    (res.errors || []).forEach((m) => toast(m, "err"));
+    await refresh();
+  } catch (e) { toast("Backfill failed: " + e.message, "err"); }
 }
 async function onToggle(r, enable) {
   try { await api("/api/devices/toggle", { method: "POST", body: JSON.stringify({ public_key: r.public_key, enabled: enable }) });
@@ -450,6 +488,9 @@ function openEdit(r) {
   (r.allowed_ips || []).slice(1).forEach((a) => addSubnetRow("edit-subnets", a.address + "/" + a.mask, a.descr || ""));
   $("edit-change-expiry").checked = false;
   const exp = $("edit-expiry"); exp.disabled = true; exp.value = "0";
+  // Prefill with the peer's current value; blank means "leave unchanged".
+  $("edit-keepalive").value = (r.persistent_keepalive === null || r.persistent_keepalive === undefined)
+    ? "" : r.persistent_keepalive;
   $("edit-modal").classList.remove("hidden");
   $("edit-name").focus();
 }
@@ -457,12 +498,14 @@ function closeEdit() { editing = null; $("edit-modal").classList.add("hidden"); 
 async function onEditSubmit(ev) {
   ev.preventDefault();
   if (!editing) return;
+  const ka = $("edit-keepalive").value.trim();
   const body = {
     public_key: editing.public_key,
     name: $("edit-name").value.trim(),
     routed_subnets: collectSubnets("edit-subnets"),
     change_expiry: $("edit-change-expiry").checked,
     expires_days: parseInt($("edit-expiry").value, 10) || 0,
+    persistent_keepalive: ka === "" ? null : parseInt(ka, 10),
   };
   try {
     await api("/api/devices/edit", { method: "POST", body: JSON.stringify(body) });
@@ -573,6 +616,7 @@ $("edit-form").addEventListener("submit", onEditSubmit);
 $("edit-add-subnet").addEventListener("click", () => addSubnetRow("edit-subnets"));
 $("edit-change-expiry").addEventListener("change", (e) => { $("edit-expiry").disabled = !e.target.checked; });
 $("import-all-btn").addEventListener("click", onImportAll);
+$("keepalive-all-btn").addEventListener("click", onKeepaliveAll);
 $("export-csv-btn").addEventListener("click", exportCsv);
 $("export-json-btn").addEventListener("click", exportJson);
 $("add-subnet-btn").addEventListener("click", () => addSubnetRow("subnets"));

@@ -133,7 +133,7 @@ class PfSenseClient:
             "endpoint": None,  # dynamic (road-warrior) peer
             "allowedips": allowed_ips,
         }
-        if persistent_keepalive:
+        if persistent_keepalive is not None:
             payload["persistentkeepalive"] = persistent_keepalive
         body = await self._request("POST", "/api/v2/vpn/wireguard/peer", json=payload)
         return body.get("data") or {}

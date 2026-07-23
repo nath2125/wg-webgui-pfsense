@@ -37,6 +37,19 @@ def clean_allowed_ips(value: str) -> str:
     return ", ".join(parts)
 
 
+def clean_keepalive(value: int | None) -> int | None:
+    """Validate a PersistentKeepalive interval in seconds.
+
+    None means "leave alone" (edit) or "use the configured default" (create);
+    0 disables keepalive. WireGuard stores the interval in a 16-bit field.
+    """
+    if value is None:
+        return None
+    if not 0 <= value <= 65535:
+        raise ValueError("persistent_keepalive must be 0-65535 seconds (0 = off).")
+    return value
+
+
 class AllowedIPEntry(BaseModel):
     """One pfSense peer AllowedIP: an address/mask routed to the peer, with a note."""
     address: str
@@ -83,6 +96,13 @@ class DeviceCreate(BaseModel):
     # Extra pfSense-side routed subnets beyond the auto-assigned /32 (e.g. a LAN
     # behind a site peer). Each has its own description.
     extra_allowed_ips: list[AllowedIPEntry] = []
+    # None = use the configured WG_PERSISTENT_KEEPALIVE default.
+    persistent_keepalive: int | None = None
+
+    @field_validator("persistent_keepalive")
+    @classmethod
+    def _ka(cls, v: int | None) -> int | None:
+        return clean_keepalive(v)
 
     @field_validator("extra_allowed_ips")
     @classmethod
@@ -153,6 +173,12 @@ class DeviceEdit(BaseModel):
     routed_subnets: list[AllowedIPEntry] | None = None   # None = unchanged; [] = clear extras
     change_expiry: bool = False                          # only touch expiry when True
     expires_days: int = 0                                # used when change_expiry; 0 = never
+    persistent_keepalive: int | None = None              # None = unchanged; 0 = off
+
+    @field_validator("persistent_keepalive")
+    @classmethod
+    def _ka(cls, v: int | None) -> int | None:
+        return clean_keepalive(v)
 
     @field_validator("name")
     @classmethod
@@ -172,6 +198,17 @@ class DeviceEdit(BaseModel):
         if v < 0 or v > 3650:
             raise ValueError("expires_days must be between 0 and 3650.")
         return v
+
+
+class KeepaliveAll(BaseModel):
+    """Bulk-set PersistentKeepalive on the tunnel's existing pfSense peers."""
+    persistent_keepalive: int
+    only_missing: bool = True   # skip peers that already have a non-zero interval
+
+    @field_validator("persistent_keepalive")
+    @classmethod
+    def _ka(cls, v: int) -> int:
+        return clean_keepalive(v)
 
 
 class ChangePassword(BaseModel):

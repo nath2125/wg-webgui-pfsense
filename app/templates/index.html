@@ -9,6 +9,7 @@
 </head>
 <body
   data-default-allowed="{{ default_allowed_ips }}"
+  data-default-keepalive="{{ default_keepalive }}"
   data-presets="{{ presets | tojson | forceescape }}"
   data-smtp="{{ '1' if smtp_enabled else '' }}"
   data-link-ttl="{{ link_ttl_minutes }}"
@@ -43,6 +44,13 @@
       <label>Expires in (days, 0 = never)
         <input id="edit-expiry" type="number" min="0" max="3650" value="0" style="width:8rem" disabled>
       </label>
+      <label>PersistentKeepalive <span class="muted small">(seconds, 0 = off — blank leaves it unchanged)</span>
+        <input id="edit-keepalive" type="number" min="0" max="65535" placeholder="unchanged" style="width:8rem">
+      </label>
+      <p class="muted small">
+        Set on the pfSense peer. Clients also need <code>PersistentKeepalive</code> in their
+        own .conf — re-issue the peer to hand out a config that includes it.
+      </p>
       <p id="edit-msg" class="msg"></p>
       <div class="row">
         <button type="submit">Save changes</button>
@@ -149,6 +157,9 @@
           <label>Expires <span class="muted">(days, 0 = never)</span>
             <input id="dev-expiry" type="number" min="0" max="3650" value="0" style="width:7rem">
           </label>
+          <label>Keepalive <span class="muted">(sec, 0 = off)</span>
+            <input id="dev-keepalive" type="number" min="0" max="65535" value="{{ default_keepalive }}" style="width:7rem">
+          </label>
           <button id="add-btn" type="submit">Generate &amp; add</button>
         </div>
         <details class="subnets-wrap">
@@ -194,6 +205,7 @@
         <div class="row" style="gap:.5rem; align-items:center;">
           <input id="search" placeholder="Search name / IP…" style="width:12rem">
           <button id="import-all-btn" class="ghost small" type="button">Import all unmanaged</button>
+          <button id="keepalive-all-btn" class="ghost small" type="button">Backfill keepalive</button>
           <button id="export-csv-btn" class="ghost small" type="button">Export CSV</button>
           <button id="export-json-btn" class="ghost small" type="button">Export JSON</button>
           <span id="counts" class="muted"></span>
@@ -202,7 +214,7 @@
       <div id="list-msg" class="msg"></div>
       <table class="devices">
         <thead>
-          <tr><th>Name</th><th>Peer IP</th><th>AllowedIPs</th><th>Public key</th><th>Source</th><th>State</th><th>Activity</th><th>Expires</th><th></th></tr>
+          <tr><th>Name</th><th>Peer IP</th><th>AllowedIPs</th><th>Public key</th><th>Source</th><th>State</th><th>Keepalive</th><th>Activity</th><th>Expires</th><th></th></tr>
         </thead>
         <tbody id="dev-rows"></tbody>
       </table>

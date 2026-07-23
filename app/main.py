@@ -38,6 +38,7 @@ from .schemas import (
     DeviceEdit,
     DeviceImport,
     EmailConfig,
+    KeepaliveAll,
     LinkCreate,
     RevokeRequest,
     RotateRequest,
@@ -337,7 +338,29 @@ def audit(session: Session, actor: str, action: str, target: str = "", detail: s
     session.commit()
 
 
-def _config_context(request: Request, name: str, ip: str, allowed_ips: list[str]) -> ClientConfigContext:
+def _peer_keepalive(peer: dict) -> int | None:
+    """PersistentKeepalive on a pfSense peer, or None when unset.
+
+    The API returns this as an int, a numeric string, or "" depending on version,
+    so normalize before comparing.
+    """
+    raw = peer.get("persistentkeepalive")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _config_context(
+    request: Request,
+    name: str,
+    ip: str,
+    allowed_ips: list[str],
+    keepalive: int | None = None,
+) -> ClientConfigContext:
+    """Build the client .conf context. `keepalive=None` uses the configured default."""
     return ClientConfigContext(
         name=name,
         address_cidr=f"{ip}/32",
@@ -345,7 +368,9 @@ def _config_context(request: Request, name: str, ip: str, allowed_ips: list[str]
         endpoint=f"{cfg(request).wg_endpoint_host}:{request.app.state.endpoint_port}",
         server_public_key=request.app.state.server_pubkey,
         allowed_ips=allowed_ips or cfg(request).default_allowed_ips,
-        persistent_keepalive=settings.wg_persistent_keepalive,
+        persistent_keepalive=(
+            settings.wg_persistent_keepalive if keepalive is None else keepalive
+        ),
         mtu=settings.wg_client_mtu,
     )
 
@@ -645,6 +670,7 @@ async def index(request: Request):
             "tunnel": c.wg_tunnel,
             "pool": c.ip_pool_cidr,
             "default_allowed_ips": c.wg_client_allowed_ips,
+            "default_keepalive": settings.wg_persistent_keepalive,
             "presets": settings.allowedips_presets,
             "smtp_enabled": settings.smtp_enabled,
             "link_ttl_minutes": settings.link_ttl_minutes,
@@ -718,6 +744,7 @@ async def api_state(
                 for a in allowed
             ],
             "enabled": p.get("enabled", True),
+            "persistent_keepalive": _peer_keepalive(p),
             "managed": d is not None,
             "created_here": d.created_here if d else None,
             "present": True,
@@ -737,6 +764,7 @@ async def api_state(
                 "assigned_ip": d.assigned_ip,
                 "allowed_ips": [{"address": d.assigned_ip, "mask": 32, "descr": ""}],
                 "enabled": None,
+                "persistent_keepalive": None,
                 "managed": True,
                 "created_here": d.created_here,
                 "present": False,
@@ -808,6 +836,11 @@ async def add_device(
 ):
     client = pf(request)
     allowed_ips = payload.client_allowed_ips.split(", ") if payload.client_allowed_ips else cfg(request).default_allowed_ips
+    keepalive = (
+        settings.wg_persistent_keepalive
+        if payload.persistent_keepalive is None
+        else payload.persistent_keepalive
+    )
 
     async with _alloc_lock:
         for d in _active_devices(session).values():
@@ -846,7 +879,7 @@ async def add_device(
                 public_key=payload.public_key,
                 descr=payload.name,
                 allowed_ips=peer_allowed_ips,
-                persistent_keepalive=settings.wg_persistent_keepalive,
+                persistent_keepalive=keepalive,
             )
         except PfSenseAPIError as e:
             raise HTTPException(502, f"pfSense rejected the peer: {e}") from e
@@ -870,7 +903,7 @@ async def add_device(
         audit(session, request.session["user"], "add", target=payload.name, detail=detail)
 
     apply_mgr(request).request()
-    config_ctx = _config_context(request, device.name, device.assigned_ip, allowed_ips)
+    config_ctx = _config_context(request, device.name, device.assigned_ip, allowed_ips, keepalive)
     return {"device": {"id": device.id, "name": device.name, "assigned_ip": device.assigned_ip},
             "config": config_ctx.model_dump()}
 
@@ -984,6 +1017,9 @@ async def edit_device(
         if payload.name and payload.name != dev.name:
             patch["descr"] = payload.name
 
+        if payload.persistent_keepalive is not None:
+            patch["persistentkeepalive"] = payload.persistent_keepalive
+
         if payload.routed_subnets is not None:
             aips = [{"address": dev.assigned_ip, "mask": 32, "descr": f"{final_name} IP"}]
             for e in payload.routed_subnets:
@@ -1014,6 +1050,52 @@ async def edit_device(
     if patch:
         apply_mgr(request).request()
     return {"ok": True}
+
+
+@app.post("/api/devices/keepalive_all")
+async def keepalive_all(
+    request: Request,
+    payload: KeepaliveAll,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    """Set PersistentKeepalive on every peer of this tunnel in one pass.
+
+    Backfills peers created before keepalive was configured. The whole batch
+    schedules a single apply, so the tunnel bounces once rather than per peer.
+    """
+    client = pf(request)
+    try:
+        peers = await client.list_peers()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+
+    tunnel = cfg(request).wg_tunnel
+    updated = skipped = 0
+    errors: list[str] = []
+    for p in peers:
+        if (p.get("tun") and p.get("tun") != tunnel) or p.get("id") is None:
+            continue
+        current = _peer_keepalive(p)
+        # "only_missing" leaves deliberately-tuned peers alone; either way there is
+        # nothing to do when the value already matches.
+        if (payload.only_missing and current) or current == payload.persistent_keepalive:
+            skipped += 1
+            continue
+        try:
+            await client.patch_peer(
+                int(p["id"]), persistentkeepalive=payload.persistent_keepalive
+            )
+            updated += 1
+        except PfSenseAPIError as e:
+            errors.append(f"{p.get('descr') or _short_key(p.get('publickey', ''))}: {e}")
+
+    if updated:
+        audit(session, request.session["user"], "keepalive",
+              target=f"{updated} peer(s)", detail=f"{payload.persistent_keepalive}s")
+        apply_mgr(request).request()
+    return {"updated": updated, "skipped": skipped, "errors": errors}
 
 
 @app.post("/api/devices/toggle")
@@ -1102,7 +1184,15 @@ async def rotate_device(
         peer = await client.find_peer_by_pubkey(payload.public_key)
         if peer is None or peer.get("id") is None:
             raise HTTPException(404, "No matching pfSense peer to rotate.")
-        await client.patch_peer(int(peer["id"]), publickey=payload.new_public_key)
+        patch: dict = {"publickey": payload.new_public_key}
+        # Peers created before keepalive was set (or imported ones) have none, which
+        # leaves them unable to re-establish on their own after a tunnel apply.
+        # Re-issuing is the natural moment to bring them up to the configured value.
+        keepalive = _peer_keepalive(peer)
+        if not keepalive:
+            keepalive = settings.wg_persistent_keepalive
+            patch["persistentkeepalive"] = keepalive
+        await client.patch_peer(int(peer["id"]), **patch)
     except PfSenseAPIError as e:
         raise HTTPException(502, f"pfSense rejected the key rotation: {e}") from e
 
@@ -1114,7 +1204,7 @@ async def rotate_device(
     apply_mgr(request).request()
 
     allowed_ips = dev.client_allowed_ips.split(", ") if dev.client_allowed_ips else cfg(request).default_allowed_ips
-    config_ctx = _config_context(request, dev.name, dev.assigned_ip, allowed_ips)
+    config_ctx = _config_context(request, dev.name, dev.assigned_ip, allowed_ips, keepalive)
     return {"ok": True, "config": config_ctx.model_dump()}
 
 
