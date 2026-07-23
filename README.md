@@ -130,7 +130,8 @@ hash is better.
 - **CSRF protection** — session-bound token required on login and every state-changing API
   call.
 - **Login lockout** — after `LOGIN_MAX_ATTEMPTS` failures an IP is locked for
-  `LOGIN_LOCKOUT_SECONDS`.
+  `LOGIN_LOCKOUT_SECONDS`. The key is the socket address unless `TRUST_PROXY_HEADERS` says a
+  trusted proxy is in front, so a spoofed `X-Forwarded-For` can't sidestep it.
 - **Optional TOTP 2FA** — a time-based one-time code (RFC 6238, stdlib) on top of the
   password, set up from the UI; state lives in a writable `TOTP_FILE` (blank ⇒ hidden).
 - **One-time links are encrypted at rest** and single-use; the decryption key is derived
@@ -143,6 +144,16 @@ hash is better.
 - **Transactional & collision-safe** — the registry row commits only after pfSense confirms
   the peer; IP allocation is serialized and computed from both the registry and the live
   pfSense peer list.
+- **AllowedIPs can't hijack the pool** — WireGuard routes by longest-prefix match across all
+  peers, so a peer AllowedIP covering the tunnel pool (or `0.0.0.0/0`) would silently steal
+  the return path for every other peer and black-hole them. Entries that overlap the pool are
+  rejected on both add and edit; subnets genuinely behind a peer never overlap it.
+- **No shell metacharacters reach pfSense** — the tunnel name is interpolated into a `wg show`
+  command that the pfSense diagnostics endpoint runs as root, so it is restricted to
+  `[A-Za-z0-9_.-]` at the wizard boundary *and* re-validated immediately before use.
+- **API docs are off by default** — `/docs`, `/redoc` and `/openapi.json` can't be auth-gated
+  the way routes are, so they stay unmounted unless `ENABLE_API_DOCS` is set.
+- **The registry is `0600`** — SQLite would otherwise create it with the process umask.
 
 ---
 
@@ -171,7 +182,47 @@ at `/setup` instead. Highlights:
 | `SESSION_SECRET` | Signs the session cookie |
 | `SESSION_HTTPS_ONLY` / `ENABLE_HSTS` | Turn on when served over HTTPS |
 | `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_SECONDS` | Brute-force lockout |
+| `TRUST_PROXY_HEADERS` | Honour `X-Forwarded-For` for lockout — **only** behind a proxy you control |
+| `ENABLE_API_DOCS` | Expose `/docs`, `/redoc`, `/openapi.json` (default off) |
 | `APPLY_DEBOUNCE_SECONDS` | Batches rapid changes into one apply |
+
+---
+
+## Deploying behind HTTPS
+
+The app speaks plain HTTP and does **not** terminate TLS. Run it behind a reverse proxy
+(nginx, Caddy, HAProxy, Traefik…) and let that hold the certificate. Serving it over bare
+HTTP puts the admin password and session cookie on the wire in cleartext, which undoes the
+lockout and 2FA.
+
+Once a proxy is in front:
+
+```ini
+SESSION_HTTPS_ONLY=true    # Secure flag on the session cookie
+ENABLE_HSTS=true           # only with a valid cert — browsers cache this
+TRUST_PROXY_HEADERS=true   # lockout keys off the real client IP
+ENABLE_API_DOCS=false      # keep the admin API surface unlisted
+PUBLIC_BASE_URL=https://vpn.example.com   # correct host in one-time links
+```
+
+`TRUST_PROXY_HEADERS` is a two-way switch, so set it deliberately:
+
+- **Off** (default) — `X-Forwarded-For` is ignored and lockout keys off the socket address.
+  Correct when the app is directly reachable. If it trusted the header here, a client could
+  vary it per request and never accumulate failures, walking straight past the lockout.
+- **On** — the leftmost `X-Forwarded-For` entry is used. Only correct when a proxy you
+  control **overwrites** that header (nginx: `proxy_set_header X-Forwarded-For $remote_addr`).
+  A proxy that *appends* to a client-supplied value reintroduces the bypass.
+
+Bind to loopback so the port isn't independently reachable:
+
+```
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Checklist: proxy holds the cert · app on loopback · the five vars above set ·
+`SESSION_SECRET` long and random · `ADMIN_PASSWORD_HASH` (not `ADMIN_PASSWORD`) ·
+`TOTP_FILE` set so 2FA is available · `.env`, `SETUP_FILE` and the SQLite registry `0600`.
 
 ## Project layout
 
