@@ -125,9 +125,16 @@ def totp_provisioning_uri(secret: str, account: str, issuer: str) -> str:
             "&algorithm=SHA1&digits=6&period=30")
 
 
-def client_ip(request: Request) -> str:
-    # Behind a reverse proxy, trust the leftmost X-Forwarded-For if present.
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
+def client_ip(request: Request, trust_proxy: bool = False) -> str:
+    """The client address used to key login lockout.
+
+    X-Forwarded-For is only honoured when the deployment explicitly says it sits
+    behind a trusted reverse proxy. Otherwise any client could vary the header per
+    request and never accumulate failures against a single key — i.e. walk straight
+    past the lockout.
+    """
+    if trust_proxy:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"

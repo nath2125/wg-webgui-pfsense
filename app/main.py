@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -29,7 +31,7 @@ from .db import engine, get_session, init_db
 from .delivery import decrypt_config, encrypt_config, send_config_email, token_id_hash
 from .ippool import PoolExhaustedError, allocate_ip, is_in_pool, iter_pool
 from .models import AuditLog, ConfigLink, Device
-from .pfsense import PfSenseAPIError, PfSenseClient
+from .pfsense import PfSenseAPIError, PfSenseClient, valid_tunnel_name
 from .setup import RuntimeConfig, SetupStore, load_runtime_config
 from .schemas import (
     ChangePassword,
@@ -213,7 +215,14 @@ async def lifespan(app: FastAPI):
             await app.state.pf.aclose()
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    lifespan=lifespan,
+    # Off by default: these are unauthenticated and enumerate every admin endpoint.
+    docs_url="/docs" if settings.enable_api_docs else None,
+    redoc_url="/redoc" if settings.enable_api_docs else None,
+    openapi_url="/openapi.json" if settings.enable_api_docs else None,
+)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret,
@@ -338,6 +347,34 @@ def audit(session: Session, actor: str, action: str, target: str = "", detail: s
     session.commit()
 
 
+def _validate_extra_allowed_ips(request: Request, entries) -> None:
+    """Reject extra AllowedIPs that would hijack other peers' traffic.
+
+    WireGuard routes by longest-prefix match across *all* peers, so an entry that
+    covers the tunnel pool (or a default route) silently steals the return path for
+    every other peer — they stop receiving replies and their traffic falls back to
+    the plain internet. Subnets genuinely behind a peer never overlap the pool.
+    """
+    pool = cfg(request).pool_network
+    for e in entries:
+        try:
+            net = ipaddress.ip_network(f"{e.address}/{e.mask}", strict=False)
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid AllowedIP {e.address}/{e.mask}: {exc}") from exc
+        if net.prefixlen == 0:
+            raise HTTPException(
+                400,
+                "A default route (0.0.0.0/0) as a peer AllowedIP would capture every "
+                "other peer's traffic. Set the client's AllowedIPs instead.",
+            )
+        if net.overlaps(pool):
+            raise HTTPException(
+                400,
+                f"AllowedIP {net} overlaps the tunnel pool {pool}. That would take over "
+                "routing for the other peers in the pool.",
+            )
+
+
 def _peer_keepalive(peer: dict) -> int | None:
     """PersistentKeepalive on a pfSense peer, or None when unset.
 
@@ -417,7 +454,7 @@ async def login_submit(
     totp_code: str = Form(""),
     session: Session = Depends(get_session),
 ):
-    ip = client_ip(request)
+    ip = client_ip(request, settings.trust_proxy_headers)
     locked = _login_guard.seconds_locked(ip)
     if locked:
         return templates.TemplateResponse(
@@ -592,6 +629,15 @@ async def setup_save(
     endpoint_host = str(body.get("endpoint_host", "")).strip()
     if not (url and api_key and tunnel and endpoint_host):
         raise HTTPException(400, "URL, API key, tunnel and endpoint host are required.")
+    # The tunnel name ends up in a command pfSense runs as root (see wg_dump), so it
+    # is constrained here at the boundary as well as at the point of use.
+    if not valid_tunnel_name(tunnel):
+        raise HTTPException(
+            400, "Tunnel name may only contain letters, numbers, dot, dash or underscore."
+        )
+    # The API key is sent to whatever host this points at; keep it to real HTTP(S) URLs.
+    if not re.match(r"^https?://[^\s/?#]+", url):
+        raise HTTPException(400, "pfSense URL must start with http:// or https://.")
     try:
         endpoint_port = int(body.get("endpoint_port") or 51820)
     except (TypeError, ValueError):
@@ -599,7 +645,6 @@ async def setup_save(
     ip_pool_cidr = str(body.get("ip_pool_cidr", "")).strip() or "192.168.90.0/24"
     client_allowed = str(body.get("client_allowed_ips", "")).strip() or "0.0.0.0/0"
     try:
-        import ipaddress
         ipaddress.ip_network(ip_pool_cidr, strict=False)
     except ValueError as e:
         raise HTTPException(400, f"Invalid IP pool CIDR: {e}") from e
@@ -841,6 +886,7 @@ async def add_device(
         if payload.persistent_keepalive is None
         else payload.persistent_keepalive
     )
+    _validate_extra_allowed_ips(request, payload.extra_allowed_ips)
 
     async with _alloc_lock:
         for d in _active_devices(session).values():
@@ -1000,6 +1046,9 @@ async def edit_device(
     ).first()
     if dev is None:
         raise HTTPException(404, "Device not tracked in the registry (import it first).")
+
+    if payload.routed_subnets is not None:
+        _validate_extra_allowed_ips(request, payload.routed_subnets)
 
     # Rename collision check.
     final_name = payload.name or dev.name

@@ -16,10 +16,20 @@ The API key is sent in the X-API-Key header and is NEVER logged.
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 
 logger = logging.getLogger("pfsense")
+
+# A pfSense WireGuard tunnel is always "tun_wgN"-shaped. The name reaches a shell
+# command in wg_dump(), and the diagnostics endpoint runs commands as root on the
+# firewall, so anything outside this charset is rejected rather than escaped.
+_TUNNEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+
+
+def valid_tunnel_name(name: str) -> bool:
+    return bool(_TUNNEL_RE.match(name or ""))
 
 
 class PfSenseAPIError(RuntimeError):
@@ -162,9 +172,12 @@ class PfSenseClient:
     async def wg_dump(self) -> dict[str, dict]:
         """Return {public_key: {latest_handshake, rx, tx, endpoint}} from `wg show`.
 
-        The tunnel name is our own config value (not user input), so it is safe to
-        interpolate into the fixed, read-only command.
+        The tunnel name is interpolated into a command that pfSense runs as root,
+        and it is settable through the setup wizard, so it is re-validated here
+        rather than trusted — this is the last gate before the shell.
         """
+        if not valid_tunnel_name(self.tunnel):
+            raise PfSenseAPIError(f"Refusing to run a command for unsafe tunnel name: {self.tunnel!r}")
         _, out = await self.run_command(f"wg show {self.tunnel} dump")
         peers: dict[str, dict] = {}
         for line in out.strip().splitlines():

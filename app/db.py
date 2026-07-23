@@ -26,9 +26,28 @@ def _ensure_sqlite_dir() -> None:
         os.makedirs(directory, exist_ok=True)
 
 
+def _restrict_sqlite_perms() -> None:
+    """Keep the registry owner-only.
+
+    SQLite creates its file with the process umask, which on most hosts leaves it
+    world-readable. It holds device names, public keys, assigned IPs and the audit
+    log — no private keys, but nothing that belongs to every local account either.
+    """
+    url = _settings.database_url
+    if "sqlite:///" not in url:
+        return
+    path = url.split("sqlite:///", 1)[1]
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass  # not present yet, or not ours to chmod
+
+
 def init_db() -> None:
     _ensure_sqlite_dir()
     SQLModel.metadata.create_all(engine)
+    _restrict_sqlite_perms()
 
 
 def get_session() -> Iterator[Session]:

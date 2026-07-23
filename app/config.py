@@ -64,9 +64,15 @@ class Settings(BaseSettings):
     session_secret: str = Field(..., description="Random secret for signed session cookie")
     session_max_age: int = 60 * 60 * 8
     session_https_only: bool = Field(False, description="Set Secure flag on cookie (HTTPS)")
+    # FastAPI's /docs, /redoc and /openapi.json cannot be auth-gated the way routes
+    # are, and they describe the whole admin API to anyone who can reach the port.
+    enable_api_docs: bool = Field(False, description="Expose /docs, /redoc, /openapi.json")
     enable_hsts: bool = Field(False, description="Send HSTS header (only if HTTPS)")
     login_max_attempts: int = 5
     login_lockout_seconds: int = 300
+    # Only enable when the app genuinely sits behind a reverse proxy you control.
+    # When false, X-Forwarded-For is ignored so it can't be spoofed to dodge lockout.
+    trust_proxy_headers: bool = Field(False, description="Honour X-Forwarded-For for login lockout")
 
     # --- Config delivery ---
     # Public base URL for building one-time links (blank = derive from request).
