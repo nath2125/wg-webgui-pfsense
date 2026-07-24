@@ -64,6 +64,24 @@ logger = logging.getLogger("app")
 settings = get_settings()
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def _asset_version(name: str) -> str:
+    """Cache-busting stamp for a static file, from its mtime.
+
+    StaticFiles sends no max-age, so browsers fall back to heuristic freshness
+    (a fraction of the file's age) and will happily serve a months-old script
+    without revalidating. For app.js that means a client keeps building configs
+    with stale logic after a deploy, which is invisible and very hard to spot.
+    """
+    try:
+        return str(int((BASE_DIR / "static" / name).stat().st_mtime))
+    except OSError:
+        return "0"
+
+
+templates.env.globals["asset_version"] = _asset_version
+
 _alloc_lock = asyncio.Lock()
 _login_guard = LoginGuard(settings.login_max_attempts, settings.login_lockout_seconds)
 

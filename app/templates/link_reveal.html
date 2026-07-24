@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Your WireGuard configuration</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
 </head>
 <body>
   <main>
@@ -25,7 +25,7 @@
       </div>
     </section>
   </main>
-  <script src="/static/qrcode.js"></script>
-  <script src="/static/reveal.js"></script>
+  <script src="/static/qrcode.js?v={{ asset_version('qrcode.js') }}"></script>
+  <script src="/static/reveal.js?v={{ asset_version('reveal.js') }}"></script>
 </body>
 </html>

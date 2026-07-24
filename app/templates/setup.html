@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf" content="{{ csrf }}">
   <title>Setup — {{ app_name }}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
 </head>
 <body data-endpoint-host="{{ d_endpoint_host }}">
   <header class="topbar">
@@ -95,6 +95,6 @@
     </section>
   </main>
 
-  <script src="/static/setup.js"></script>
+  <script src="/static/setup.js?v={{ asset_version('setup.js') }}"></script>
 </body>
 </html>

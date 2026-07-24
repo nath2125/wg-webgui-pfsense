@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf" content="{{ csrf }}">
   <title>{{ app_name }}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
 </head>
 <body
   data-default-allowed="{{ default_allowed_ips }}"
@@ -148,7 +148,7 @@
       <form id="add-form">
         <div class="row">
           <label class="grow">Device name <span class="muted">(pfSense peer description)</span>
-            <input id="dev-name" placeholder="e.g. Laptop" required>
+            <input id="dev-name" placeholder="e.g. Nathan-Laptop" required>
           </label>
           <label class="grow">Client AllowedIPs <span class="muted">(routing, not ACL)</span>
             <input id="dev-aips" list="aips-presets" placeholder="0.0.0.0/0">
@@ -231,8 +231,8 @@
     </section>
   </main>
 
-  <script src="/static/nacl.min.js"></script>
-  <script src="/static/qrcode.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/nacl.min.js?v={{ asset_version('nacl.min.js') }}"></script>
+  <script src="/static/qrcode.js?v={{ asset_version('qrcode.js') }}"></script>
+  <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>
 </body>
 </html>
