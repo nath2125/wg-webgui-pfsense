@@ -285,6 +285,9 @@ class ClientConfigContext(BaseModel):
     dns: str
     endpoint: str
     server_public_key: str
+    # Peers carrying a preshared key on pfSense will not complete a handshake
+    # unless the client presents the same one, so it has to ride along here.
+    preshared_key: str | None = None
     allowed_ips: list[str]
     persistent_keepalive: int
     mtu: int

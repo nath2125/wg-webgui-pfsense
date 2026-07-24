@@ -64,7 +64,6 @@ logger = logging.getLogger("app")
 settings = get_settings()
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
 _alloc_lock = asyncio.Lock()
 _login_guard = LoginGuard(settings.login_max_attempts, settings.login_lockout_seconds)
 
@@ -396,6 +395,7 @@ def _config_context(
     ip: str,
     allowed_ips: list[str],
     keepalive: int | None = None,
+    preshared_key: str | None = None,
 ) -> ClientConfigContext:
     """Build the client .conf context. `keepalive=None` uses the configured default."""
     return ClientConfigContext(
@@ -404,6 +404,7 @@ def _config_context(
         dns=settings.wg_client_dns,
         endpoint=f"{cfg(request).wg_endpoint_host}:{request.app.state.endpoint_port}",
         server_public_key=request.app.state.server_pubkey,
+        preshared_key=preshared_key,
         allowed_ips=allowed_ips or cfg(request).default_allowed_ips,
         persistent_keepalive=(
             settings.wg_persistent_keepalive if keepalive is None else keepalive
@@ -1233,6 +1234,18 @@ async def rotate_device(
         peer = await client.find_peer_by_pubkey(payload.public_key)
         if peer is None or peer.get("id") is None:
             raise HTTPException(404, "No matching pfSense peer to rotate.")
+        # Read the peer's preshared key before patching, while `wg show` still
+        # knows it by the old public key. The REST API never returns it, and a
+        # reissue that drops it produces a config that looks correct but can
+        # never complete a handshake — so refuse rather than guess.
+        live = (await client.wg_dump()).get(payload.public_key)
+        if live is None:
+            raise HTTPException(
+                503,
+                "pfSense is not reporting this peer on the tunnel, so its preshared "
+                "key cannot be read. Check the tunnel is up, then retry.",
+            )
+        preshared_key = live.get("preshared_key")
         patch: dict = {"publickey": payload.new_public_key}
         # Peers created before keepalive was set (or imported ones) have none, which
         # leaves them unable to re-establish on their own after a tunnel apply.
@@ -1253,7 +1266,9 @@ async def rotate_device(
     apply_mgr(request).request()
 
     allowed_ips = dev.client_allowed_ips.split(", ") if dev.client_allowed_ips else cfg(request).default_allowed_ips
-    config_ctx = _config_context(request, dev.name, dev.assigned_ip, allowed_ips, keepalive)
+    config_ctx = _config_context(
+        request, dev.name, dev.assigned_ip, allowed_ips, keepalive, preshared_key
+    )
     return {"ok": True, "config": config_ctx.model_dump()}
 
 

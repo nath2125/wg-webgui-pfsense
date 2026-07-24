@@ -170,7 +170,10 @@ class PfSenseClient:
         return data.get("result_code", -1), data.get("output", "")
 
     async def wg_dump(self) -> dict[str, dict]:
-        """Return {public_key: {latest_handshake, rx, tx, endpoint}} from `wg show`.
+        """Return {public_key: {latest_handshake, rx, tx, endpoint, preshared_key}}.
+
+        The preshared key is only reachable this way: the REST API omits it from
+        the peer objects entirely, so `wg show` is the one source we have for it.
 
         The tunnel name is interpolated into a command that pfSense runs as root,
         and it is settable through the setup wizard, so it is re-validated here
@@ -189,6 +192,7 @@ class PfSenseClient:
                 "rx": int(f[5]) if f[5].isdigit() else 0,
                 "tx": int(f[6]) if f[6].isdigit() else 0,
                 "endpoint": None if f[2] in ("(none)", "") else f[2],
+                "preshared_key": None if f[1] in ("(none)", "") else f[1],
             }
         return peers
 

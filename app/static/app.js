@@ -51,6 +51,7 @@ function buildConf(cfg, privateKey) {
   if (cfg.mtu) lines.push("MTU = " + cfg.mtu);
   lines.push("", "[Peer]");
   lines.push("PublicKey = " + cfg.server_public_key);
+  if (cfg.preshared_key) lines.push("PresharedKey = " + cfg.preshared_key);
   lines.push("Endpoint = " + cfg.endpoint);
   lines.push("AllowedIPs = " + cfg.allowed_ips.join(", "));
   if (cfg.persistent_keepalive) lines.push("PersistentKeepalive = " + cfg.persistent_keepalive);
