@@ -147,8 +147,9 @@ class TrafficMonitor:
                 "up_series": [round(s[1]) for s in hist],
                 "down_series": [round(s[2]) for s in hist],
             })
-        # Busiest first — this is the list you'd act on when a peer saturates the link.
-        peers.sort(key=lambda p: p["up"] + p["down"], reverse=True)
+        # Stable order (name, then key) so rows don't reshuffle every poll — a
+        # throughput sort would make the table jump around on the live dashboard.
+        peers.sort(key=lambda p: (p["name"].lower(), p["public_key"]))
 
         cur_wall, cur_up, cur_down = (
             self._agg[-1] if self._agg else (self._last_wall, 0.0, 0.0)

@@ -366,12 +366,12 @@ async function refreshMonitor() {
     setBar("mon-bar-up", "mon-pipe-up", pipe.up_used_pct, pipe.up_mbit);
   } else { pipeBox.classList.add("hidden"); }
 
+  // Show every returned peer in the backend's stable order; don't filter by
+  // current activity (that flips the row set each poll and makes the card jump).
   const peers = s.peers || [];
-  const active = peers.filter((p) => p.up || p.down);
-  const shown = active.length ? active : peers;
   $("mon-empty").classList.toggle("hidden", peers.length > 0);
   const tbody = $("mon-rows"); tbody.innerHTML = "";
-  shown.forEach((p) => {
+  peers.forEach((p) => {
     const tr = document.createElement("tr");
     tr.innerHTML =
       "<td>" + escapeHtml(p.name) + "</td>" +
@@ -477,34 +477,54 @@ async function refreshShaper() {
 function shReadWeights() {
   return { lan_weight: parseInt($("sh-lan").value, 10) || 1, wg_weight: parseInt($("sh-wg").value, 10) || 1 };
 }
+// Every shaper action does a pfSense filter-reload (apply), which takes a few
+// seconds. Show that immediately and disable the controls so it doesn't feel frozen.
+function shBusy(on) {
+  const m = $("sh-msg");
+  if (on) { m.className = "msg"; m.textContent = "Applying to pfSense… (a few seconds)"; }
+  ["sh-setup-btn", "sh-ratio-btn", "sh-teardown-btn"].forEach((id) => { $(id).disabled = on; });
+}
+async function shAction(fn) {
+  shBusy(true);
+  try { await fn(); }
+  finally { shBusy(false); }
+}
 async function shSetup() {
   const w = shReadWeights();
   const body = { down_mbit: parseInt($("sh-down").value, 10), up_mbit: parseInt($("sh-up").value, 10), ...w };
   if (!body.down_mbit || !body.up_mbit) { toast("Enter WAN download and upload speeds", "err"); return; }
-  try {
-    SH_STATE = await api("/api/shaper/setup", { method: "POST", body: JSON.stringify(body) });
-    renderShaper(); toast("Shaping set up / synced", "ok");
-  } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+  await shAction(async () => {
+    try {
+      SH_STATE = await api("/api/shaper/setup", { method: "POST", body: JSON.stringify(body) });
+      renderShaper(); toast("Shaping set up / synced", "ok");
+    } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+  });
 }
 async function shRatio() {
-  try {
-    SH_STATE = await api("/api/shaper/ratio", { method: "POST", body: JSON.stringify(shReadWeights()) });
-    renderShaper(); toast("Ratio applied", "ok");
-  } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+  await shAction(async () => {
+    try {
+      SH_STATE = await api("/api/shaper/ratio", { method: "POST", body: JSON.stringify(shReadWeights()) });
+      renderShaper(); toast("Ratio applied", "ok");
+    } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+  });
 }
 async function shAssignRule(ruleId, side) {
-  try {
-    SH_STATE = await api("/api/shaper/rule", { method: "POST", body: JSON.stringify({ rule_id: ruleId, side }) });
-    renderShaper();
-    toast(side === "none" ? "Detached rule" : "Rule → " + shSideLabel(side), "ok");
-  } catch (e) { toast(e.message, "err"); }
+  await shAction(async () => {
+    try {
+      SH_STATE = await api("/api/shaper/rule", { method: "POST", body: JSON.stringify({ rule_id: ruleId, side }) });
+      renderShaper();
+      toast(side === "none" ? "Detached rule" : "Rule → " + shSideLabel(side), "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 async function shTeardown() {
   if (!confirm("Remove the wgweb limiters and detach any rules using them?")) return;
-  try {
-    SH_STATE = await api("/api/shaper/teardown", { method: "POST", body: "{}" });
-    renderShaper(); toast("Shaping removed", "ok");
-  } catch (e) { toast(e.message, "err"); }
+  await shAction(async () => {
+    try {
+      SH_STATE = await api("/api/shaper/teardown", { method: "POST", body: "{}" });
+      renderShaper(); toast("Shaping removed", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 function renderRows() {
