@@ -301,6 +301,212 @@ function keepaliveCell(r) {
   return '<span class="muted">' + ka + 's</span>';
 }
 
+// ---- traffic monitor ----
+function fmtBits(bps) {
+  if (!bps || bps < 1) return "0 b/s";
+  const u = ["b/s", "Kb/s", "Mb/s", "Gb/s"]; let i = 0; let n = bps;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return n.toFixed(i === 0 ? 0 : (n < 10 ? 2 : (n < 100 ? 1 : 0))) + " " + u[i];
+}
+function svgWrap(w, h, inner) {
+  return '<svg class="spark" width="' + w + '" height="' + h +
+    '" viewBox="0 0 ' + w + " " + h + '" preserveAspectRatio="none">' + inner + "</svg>";
+}
+function sparkPath(values, max, w, h, pad) {
+  if (!values || values.length < 2) return "";
+  const n = values.length, step = (w - pad * 2) / (n - 1);
+  let d = "";
+  for (let i = 0; i < n; i++) {
+    const x = pad + i * step;
+    const y = h - pad - (values[i] / max) * (h - pad * 2);
+    d += (i ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1) + " ";
+  }
+  return d.trim();
+}
+function twinSpark(downS, upS, w, h, pad) {
+  const dn = downS || [], up = upS || [];
+  const max = Math.max(1, Math.max.apply(null, dn.concat(up).concat([0])));
+  return svgWrap(w, h,
+    '<path class="s-down" d="' + sparkPath(dn, max, w, h, pad) + '"/>' +
+    '<path class="s-up" d="' + sparkPath(up, max, w, h, pad) + '"/>');
+}
+function aggSpark(series) {
+  return twinSpark(series.map((s) => s.down), series.map((s) => s.up), 220, 40, 3);
+}
+function setBar(barId, txtId, pct, mbit) {
+  const el = $(barId);
+  const p = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+  el.style.width = p + "%";
+  el.classList.toggle("hot", p >= 85);
+  el.classList.toggle("warm", p >= 60 && p < 85);
+  $(txtId).textContent = (pct == null ? "—" : pct + "%") + (mbit ? " of " + mbit + " Mbit" : "");
+}
+async function refreshMonitor() {
+  let s;
+  try { s = await api("/api/monitor", { method: "GET" }); }
+  catch (e) { return; }  // best-effort; never disrupt the page
+  const card = $("monitor-card");
+  if (!s || s.enabled === false) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+
+  const agg = s.aggregate || { up: 0, down: 0, peak_up: 0, peak_down: 0, series: [] };
+  $("mon-total-down").textContent = fmtBits(agg.down);
+  $("mon-total-up").textContent = fmtBits(agg.up);
+  $("mon-peak-down").textContent = agg.peak_down ? "peak " + fmtBits(agg.peak_down) : "";
+  $("mon-peak-up").textContent = agg.peak_up ? "peak " + fmtBits(agg.peak_up) : "";
+  $("mon-agg-spark").innerHTML = aggSpark(agg.series || []);
+  const st = $("mon-status");
+  if (s.last_error) { st.className = "small err-text"; st.textContent = "error: " + s.last_error; }
+  else { st.className = "muted small"; st.textContent = s.sampled_at ? "updated " + new Date(s.sampled_at * 1000).toLocaleTimeString() : ""; }
+
+  const pipe = s.pipe, pipeBox = $("mon-pipe");
+  if (pipe && (pipe.down_used_pct != null || pipe.up_used_pct != null)) {
+    pipeBox.classList.remove("hidden");
+    setBar("mon-bar-down", "mon-pipe-down", pipe.down_used_pct, pipe.down_mbit);
+    setBar("mon-bar-up", "mon-pipe-up", pipe.up_used_pct, pipe.up_mbit);
+  } else { pipeBox.classList.add("hidden"); }
+
+  const peers = s.peers || [];
+  const active = peers.filter((p) => p.up || p.down);
+  const shown = active.length ? active : peers;
+  $("mon-empty").classList.toggle("hidden", peers.length > 0);
+  const tbody = $("mon-rows"); tbody.innerHTML = "";
+  shown.forEach((p) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + escapeHtml(p.name) + "</td>" +
+      "<td class='mon-rate-cell'>" + fmtBits(p.down) + "</td>" +
+      "<td class='mon-rate-cell'>" + fmtBits(p.up) + "</td>" +
+      "<td>" + twinSpark(p.down_series, p.up_series, 120, 22, 2) + "</td>";
+    tbody.appendChild(tr);
+  });
+}
+
+// ---- traffic shaping (QoS) ----
+let SH_STATE = null;
+let SH_RULES = [];
+function shSideLabel(side) { return side === "lan" ? "Local" : side === "wg" ? "WG" : "none"; }
+function shSyncRatioUI() {
+  const lan = parseInt($("sh-lan").value, 10) || 1;
+  const wg = parseInt($("sh-wg").value, 10) || 1;
+  const pct = Math.round((lan / (lan + wg)) * 100);
+  $("sh-lan-val").textContent = lan + " / WG " + wg;
+  $("sh-ratio-note").textContent =
+    "Under congestion Local gets ~" + pct + "%, WG ~" + (100 - pct) +
+    "%. When local traffic is idle, WG still gets the full pipe.";
+}
+function shSideBadge(side) {
+  if (side === "lan") return "<span class='badge ok'>Local</span>";
+  if (side === "wg") return "<span class='badge warn'>WG</span>";
+  return "<span class='muted'>—</span>";
+}
+function renderShaperRules() {
+  const q = ($("sh-rule-search").value || "").toLowerCase().trim();
+  // Default view = the real status (only shaped rules). Searching reveals every
+  // pass rule so you can add one.
+  const list = SH_RULES.filter((r) => {
+    if (q) {
+      const hay = (r.interface_label + " " + r.descr + " " + r.id).toLowerCase();
+      return hay.includes(q);
+    }
+    return r.side; // shaped only, when not searching
+  });
+  const tbody = $("sh-rule-rows"); tbody.innerHTML = "";
+  $("sh-rule-empty").classList.toggle("hidden", q ? true : SH_RULES.some((r) => r.side));
+  list.forEach((r) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + shSideBadge(r.side) + "</td>" +
+      "<td>" + escapeHtml(r.interface_label) + "</td>" +
+      "<td>" + escapeHtml(r.descr || "(no description)") + "</td>" +
+      "<td class='actions'></td>";
+    const cell = tr.querySelector(".actions");
+    if (r.other_limiter) {
+      cell.innerHTML = "<span class='muted small'>other limiter</span>";
+    } else {
+      if (r.side !== "lan") cell.appendChild(mkBtn("Local", "ghost small", () => shAssignRule(r.id, "lan")));
+      if (r.side !== "wg") cell.appendChild(mkBtn("WG", "ghost small", () => shAssignRule(r.id, "wg")));
+      if (r.side) cell.appendChild(mkBtn("Detach", "danger small", () => shAssignRule(r.id, "none")));
+    }
+    tbody.appendChild(tr);
+  });
+}
+function renderShaper() {
+  const s = SH_STATE;
+  const card = $("shaper-card");
+  if (!s || s.enabled === false) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const d = s.defaults || {};
+  const configured = !!s.configured;
+
+  const st = $("shaper-status");
+  if (s.error) { st.className = "badge err"; st.textContent = "error"; }
+  else if (configured) { st.className = "badge ok"; st.textContent = "active"; }
+  else { st.className = "badge muted"; st.textContent = "not set up"; }
+
+  // Prefill without clobbering fields the user is editing.
+  const down = configured ? s.down.bw_mbit : d.down_mbit;
+  const up = configured ? s.up.bw_mbit : d.up_mbit;
+  const lan = configured ? (s.down.weights.lan ?? d.lan_weight) : d.lan_weight;
+  const wg = configured ? (s.down.weights.wg ?? d.wg_weight) : d.wg_weight;
+  if (!$("sh-down").value && down) $("sh-down").value = down;
+  if (!$("sh-up").value && up) $("sh-up").value = up;
+  if (!$("sh-wg").value && wg) $("sh-wg").value = wg;
+  if (lan) $("sh-lan").value = lan;
+  shSyncRatioUI();
+
+  $("sh-setup-btn").textContent = configured ? "Re-sync bandwidth" : "Set up shaping";
+  $("sh-ratio-btn").classList.toggle("hidden", !configured);
+  $("sh-teardown-btn").classList.toggle("hidden", !configured);
+  $("sh-rules-wrap").classList.toggle("hidden", !configured);
+
+  const msg = $("sh-msg");
+  if (s.error) { msg.className = "msg err"; msg.textContent = "pfSense: " + s.error; }
+  else { msg.className = "msg"; msg.textContent = ""; }
+
+  const c = s.shaped_counts || { lan: 0, wg: 0 };
+  $("sh-rule-summary").textContent = "— Local: " + c.lan + " · WG: " + c.wg;
+  SH_RULES = s.rules || [];
+  renderShaperRules();
+}
+async function refreshShaper() {
+  try { SH_STATE = await api("/api/shaper", { method: "GET" }); }
+  catch (e) { return; }
+  renderShaper();
+}
+function shReadWeights() {
+  return { lan_weight: parseInt($("sh-lan").value, 10) || 1, wg_weight: parseInt($("sh-wg").value, 10) || 1 };
+}
+async function shSetup() {
+  const w = shReadWeights();
+  const body = { down_mbit: parseInt($("sh-down").value, 10), up_mbit: parseInt($("sh-up").value, 10), ...w };
+  if (!body.down_mbit || !body.up_mbit) { toast("Enter WAN download and upload speeds", "err"); return; }
+  try {
+    SH_STATE = await api("/api/shaper/setup", { method: "POST", body: JSON.stringify(body) });
+    renderShaper(); toast("Shaping set up / synced", "ok");
+  } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+}
+async function shRatio() {
+  try {
+    SH_STATE = await api("/api/shaper/ratio", { method: "POST", body: JSON.stringify(shReadWeights()) });
+    renderShaper(); toast("Ratio applied", "ok");
+  } catch (e) { const m = $("sh-msg"); m.className = "msg err"; m.textContent = e.message; }
+}
+async function shAssignRule(ruleId, side) {
+  try {
+    SH_STATE = await api("/api/shaper/rule", { method: "POST", body: JSON.stringify({ rule_id: ruleId, side }) });
+    renderShaper();
+    toast(side === "none" ? "Detached rule" : "Rule → " + shSideLabel(side), "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function shTeardown() {
+  if (!confirm("Remove the wgweb limiters and detach any rules using them?")) return;
+  try {
+    SH_STATE = await api("/api/shaper/teardown", { method: "POST", body: "{}" });
+    renderShaper(); toast("Shaping removed", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
 function renderRows() {
   const q = ($("search").value || "").toLowerCase().trim();
   const tbody = $("dev-rows"); tbody.innerHTML = "";
@@ -622,4 +828,13 @@ $("export-csv-btn").addEventListener("click", exportCsv);
 $("export-json-btn").addEventListener("click", exportJson);
 $("add-subnet-btn").addEventListener("click", () => addSubnetRow("subnets"));
 $("search").addEventListener("input", renderRows);
+$("sh-setup-btn").addEventListener("click", shSetup);
+$("sh-ratio-btn").addEventListener("click", shRatio);
+$("sh-teardown-btn").addEventListener("click", shTeardown);
+$("sh-lan").addEventListener("input", shSyncRatioUI);
+$("sh-wg").addEventListener("input", shSyncRatioUI);
+$("sh-rule-search").addEventListener("input", renderShaperRules);
 refresh();
+refreshMonitor();
+setInterval(refreshMonitor, 5000);
+refreshShaper();

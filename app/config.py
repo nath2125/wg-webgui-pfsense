@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     # --- Apply debounce ---
     apply_debounce_seconds: float = 2.0
 
+    # --- Traffic monitor (visibility) ---
+    # Samples per-peer WireGuard throughput on a background loop and serves it at
+    # /api/monitor. Read-only: it never touches pfSense config.
+    monitor_enabled: bool = Field(True, description="Enable the traffic monitor loop")
+    monitor_interval_seconds: float = Field(5.0, description="Seconds between samples")
+    monitor_history_minutes: int = Field(15, description="Rolling window kept in memory")
+    # Real WAN line rate (Mbit/s), used only to show WG's share of the link. 0 = omit
+    # those bars. Must be user-measured; the app can't detect the true line rate.
+    monitor_wan_down_mbit: float = Field(0.0, description="WAN download capacity, Mbit/s")
+    monitor_wan_up_mbit: float = Field(0.0, description="WAN upload capacity, Mbit/s")
+
+    # --- Traffic shaping (QoS: LAN priority over WireGuard) ---
+    # Manages its own limiters/queues only; rule attachment is user-driven. Creating
+    # the scheme is an explicit action in the UI — nothing is applied automatically.
+    shaper_enabled: bool = Field(True, description="Expose the /api/shaper section")
+    # "Local" = all local networks (LAN + every VLAN) as one class vs WireGuard peers.
+    # 80 vs 20 -> Local gets 80% of the pipe under congestion, WG 20%.
+    shaper_lan_weight: int = Field(80, description="Default Local queue weight (1-100)")
+    shaper_wg_weight: int = Field(20, description="Default WireGuard queue weight (1-100)")
+
     # --- Storage ---
     database_url: str = "sqlite:////data/devices.db"
 

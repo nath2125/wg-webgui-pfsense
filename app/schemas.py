@@ -291,3 +291,62 @@ class ClientConfigContext(BaseModel):
     allowed_ips: list[str]
     persistent_keepalive: int
     mtu: int
+
+
+# --------------------------------------------------------------------------- #
+# Traffic shaper (QoS) request models
+# --------------------------------------------------------------------------- #
+def _check_weight(v: int) -> int:
+    if not (1 <= v <= 100):
+        raise ValueError("weight must be between 1 and 100.")
+    return v
+
+
+class ShaperSetup(BaseModel):
+    """Create/sync the LAN-priority limiters."""
+    down_mbit: int
+    up_mbit: int
+    lan_weight: int = 100
+    wg_weight: int = 5
+
+    @field_validator("down_mbit", "up_mbit")
+    @classmethod
+    def _check_bw(cls, v: int) -> int:
+        if not (1 <= v <= 1_000_000):
+            raise ValueError("bandwidth (Mbit/s) must be between 1 and 1000000.")
+        return v
+
+    @field_validator("lan_weight", "wg_weight")
+    @classmethod
+    def _check_w(cls, v: int) -> int:
+        return _check_weight(v)
+
+
+class ShaperRatio(BaseModel):
+    lan_weight: int
+    wg_weight: int
+
+    @field_validator("lan_weight", "wg_weight")
+    @classmethod
+    def _check_w(cls, v: int) -> int:
+        return _check_weight(v)
+
+
+class ShaperRule(BaseModel):
+    """Assign one firewall rule to a shaping side."""
+    rule_id: int
+    side: str  # "lan" (Local) | "wg" | "none"
+
+    @field_validator("rule_id")
+    @classmethod
+    def _check_id(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("rule_id must be >= 0.")
+        return v
+
+    @field_validator("side")
+    @classmethod
+    def _check_side(cls, v: str) -> str:
+        if v not in ("lan", "wg", "none"):
+            raise ValueError("side must be 'lan', 'wg', or 'none'.")
+        return v

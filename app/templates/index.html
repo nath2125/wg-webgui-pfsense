@@ -198,6 +198,106 @@
       </div>
     </section>
 
+    <!-- Traffic monitor -->
+    <section id="monitor-card" class="card hidden">
+      <div class="row between">
+        <h2>Traffic monitor</h2>
+        <span id="mon-status" class="muted small"></span>
+      </div>
+      <div class="mon-agg">
+        <div class="mon-agg-figs">
+          <div class="mon-fig">
+            <span class="k">Download (to clients)</span>
+            <span id="mon-total-down" class="mon-rate">—</span>
+            <span id="mon-peak-down" class="muted small"></span>
+          </div>
+          <div class="mon-fig">
+            <span class="k">Upload (from clients)</span>
+            <span id="mon-total-up" class="mon-rate">—</span>
+            <span id="mon-peak-up" class="muted small"></span>
+          </div>
+          <div id="mon-agg-spark" class="mon-spark" title="Aggregate WireGuard throughput"></div>
+        </div>
+        <div id="mon-pipe" class="mon-pipe hidden">
+          <div class="mon-bar-row">
+            <span class="k">WG share of WAN ↓</span>
+            <div class="mon-bar"><div id="mon-bar-down" class="mon-bar-fill"></div></div>
+            <span id="mon-pipe-down" class="muted small"></span>
+          </div>
+          <div class="mon-bar-row">
+            <span class="k">WG share of WAN ↑</span>
+            <div class="mon-bar"><div id="mon-bar-up" class="mon-bar-fill"></div></div>
+            <span id="mon-pipe-up" class="muted small"></span>
+          </div>
+        </div>
+      </div>
+      <table class="devices mon-table">
+        <thead>
+          <tr><th>Peer</th><th>↓ Download</th><th>↑ Upload</th><th>Recent</th></tr>
+        </thead>
+        <tbody id="mon-rows"></tbody>
+      </table>
+      <p id="mon-empty" class="muted small">Waiting for the first samples…</p>
+    </section>
+
+    <!-- Traffic shaping (QoS) -->
+    <section id="shaper-card" class="card hidden">
+      <div class="row between">
+        <h2>Traffic shaping — Local priority over WireGuard</h2>
+        <span id="shaper-status" class="badge muted">—</span>
+      </div>
+      <p class="muted small">
+        Prioritises <strong>Local</strong> traffic — your LAN and all VLANs, i.e. anything
+        local heading out — over external WireGuard peers on the WAN uplink under congestion.
+        WG peers still get the full pipe when local traffic is idle. Manages its own
+        limiters/queues only.
+      </p>
+
+      <div class="row">
+        <label>WAN download <span class="muted">(Mbit/s)</span>
+          <input id="sh-down" type="number" min="1" max="1000000" style="width:8rem">
+        </label>
+        <label>WAN upload <span class="muted">(Mbit/s)</span>
+          <input id="sh-up" type="number" min="1" max="1000000" style="width:8rem">
+        </label>
+        <label>WG weight <span class="muted">(1–100)</span>
+          <input id="sh-wg" type="number" min="1" max="100" style="width:6rem">
+        </label>
+        <button id="sh-setup-btn" type="button">Set up shaping</button>
+        <button id="sh-teardown-btn" class="danger hidden" type="button">Remove</button>
+      </div>
+
+      <div class="row" style="align-items:center;">
+        <label class="grow">Local priority — Local weight <span id="sh-lan-val" class="v"></span>
+          <input id="sh-lan" type="range" min="1" max="100" value="80">
+        </label>
+        <button id="sh-ratio-btn" class="ghost hidden" type="button">Apply ratio</button>
+      </div>
+      <p id="sh-ratio-note" class="muted small"></p>
+      <p id="sh-msg" class="msg"></p>
+
+      <div id="sh-rules-wrap" class="hidden">
+        <div class="row between">
+          <h3>Shaped rules <span id="sh-rule-summary" class="muted small"></span></h3>
+          <input id="sh-rule-search" placeholder="Search rules to add… (interface / description)" style="width:18rem">
+        </div>
+        <p class="muted small">
+          The rules below currently carry the limiters — this is the real status. Set any rule to
+          <strong>Local</strong> or <strong>WG</strong>, or detach it. Search to find other pass
+          rules to add (e.g. your internet-out rules: local subnets → Local, WireGuard → WG).
+        </p>
+        <table class="devices">
+          <thead>
+            <tr><th>Side</th><th>Interface</th><th>Description</th><th>Actions</th></tr>
+          </thead>
+          <tbody id="sh-rule-rows"></tbody>
+        </table>
+        <p id="sh-rule-empty" class="muted small hidden">
+          No rules shaped yet — search above to find your internet-out rules and set Local / WG.
+        </p>
+      </div>
+    </section>
+
     <!-- Peers -->
     <section class="card">
       <div class="row between">

@@ -31,7 +31,9 @@ from .db import engine, get_session, init_db
 from .delivery import decrypt_config, encrypt_config, send_config_email, token_id_hash
 from .ippool import PoolExhaustedError, allocate_ip, is_in_pool, iter_pool
 from .models import AuditLog, ConfigLink, Device
+from .monitor import TrafficMonitor
 from .pfsense import PfSenseAPIError, PfSenseClient, valid_tunnel_name
+from .shaper import ShaperClient
 from .setup import RuntimeConfig, SetupStore, load_runtime_config
 from .schemas import (
     ChangePassword,
@@ -44,6 +46,9 @@ from .schemas import (
     LinkCreate,
     RevokeRequest,
     RotateRequest,
+    ShaperRatio,
+    ShaperRule,
+    ShaperSetup,
     ToggleRequest,
 )
 from .security import (
@@ -148,6 +153,31 @@ async def _expiry_sweeper(app: FastAPI, interval: int = 60) -> None:
             logger.warning("expiry sweeper error: %s", e)
 
 
+async def _traffic_monitor_loop(app: FastAPI, interval: float) -> None:
+    """Sample per-peer WireGuard throughput into the in-memory TrafficMonitor.
+
+    Read-only (just ``wg_dump``), so a failure here can never affect the tunnel;
+    it records the error on the monitor and keeps trying.
+    """
+    monitor: TrafficMonitor = app.state.monitor
+    while True:
+        await asyncio.sleep(interval)
+        client = getattr(app.state, "pf", None)
+        if client is None:  # setup mode: nothing to sample yet
+            continue
+        try:
+            live = await client.wg_dump()
+            monitor.ingest(live)
+            monitor.last_error = None
+        except asyncio.CancelledError:
+            raise
+        except PfSenseAPIError as e:
+            monitor.last_error = str(e)
+        except Exception as e:  # never let the monitor die
+            monitor.last_error = str(e)
+            logger.warning("traffic monitor error: %s", e)
+
+
 async def rebuild_pf(app: FastAPI) -> None:
     """(Re)build the pfSense client + apply manager from the effective config.
 
@@ -160,6 +190,7 @@ async def rebuild_pf(app: FastAPI) -> None:
 
     old_client = getattr(app.state, "pf", None)
     old_apply = getattr(app.state, "apply", None)
+    old_shaper = getattr(app.state, "shaper", None)
     if old_apply is not None:
         try:
             await old_apply.stop()
@@ -170,11 +201,17 @@ async def rebuild_pf(app: FastAPI) -> None:
             await old_client.aclose()
         except Exception:  # noqa: BLE001
             pass
+    if old_shaper is not None:
+        try:
+            await old_shaper.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
     app.state.endpoint_port = cfg_obj.wg_endpoint_port
     if not cfg_obj.configured:
         app.state.pf = None
         app.state.apply = None
+        app.state.shaper = None
         app.state.server_pubkey = ""
         logger.info("Setup mode: pfSense not configured yet — open /setup to onboard.")
         return
@@ -204,6 +241,16 @@ async def rebuild_pf(app: FastAPI) -> None:
 
     app.state.pf = client
     app.state.apply = mgr
+    app.state.shaper = (
+        ShaperClient(
+            cfg_obj.pfsense_api_url,
+            cfg_obj.pfsense_api_key,
+            verify_tls=cfg_obj.pfsense_verify_tls,
+            timeout=settings.pfsense_timeout,
+        )
+        if settings.shaper_enabled
+        else None
+    )
     app.state.server_pubkey = server_pubkey
     if not server_pubkey:
         logger.warning("No server public key yet; client configs will be incomplete.")
@@ -216,20 +263,39 @@ async def lifespan(app: FastAPI):
     init_db()
     app.state.pf = None
     app.state.apply = None
+    app.state.shaper = None
+    app.state.monitor = None
     await rebuild_pf(app)
     sweeper = asyncio.create_task(_expiry_sweeper(app), name="expiry-sweeper")
+
+    monitor_task = None
+    if settings.monitor_enabled:
+        interval = max(1.0, settings.monitor_interval_seconds)
+        history_len = max(2, int(settings.monitor_history_minutes * 60 / interval))
+        app.state.monitor = TrafficMonitor(interval=interval, history_len=history_len)
+        monitor_task = asyncio.create_task(
+            _traffic_monitor_loop(app, interval), name="traffic-monitor"
+        )
+
     try:
         yield
     finally:
         sweeper.cancel()
-        try:
-            await sweeper
-        except asyncio.CancelledError:
-            pass
+        if monitor_task is not None:
+            monitor_task.cancel()
+        for task in (sweeper, monitor_task):
+            if task is None:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         if app.state.apply is not None:
             await app.state.apply.stop()
         if app.state.pf is not None:
             await app.state.pf.aclose()
+        if app.state.shaper is not None:
+            await app.state.shaper.aclose()
 
 
 app = FastAPI(
@@ -341,6 +407,16 @@ def _totp_enabled() -> bool:
 
 def pf(request: Request) -> PfSenseClient:
     return request.app.state.pf
+
+
+def shaper(request: Request) -> ShaperClient:
+    sc = getattr(request.app.state, "shaper", None)
+    if sc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Traffic shaping unavailable (pfSense not configured or shaper disabled).",
+        )
+    return sc
 
 
 def cfg(request: Request) -> RuntimeConfig:
@@ -868,6 +944,129 @@ async def api_state(
             "last_error": mgr.last_error,
         },
     }
+
+
+@app.get("/api/monitor")
+async def api_monitor(
+    request: Request,
+    _: None = Depends(require_api_auth),
+    session: Session = Depends(get_session),
+):
+    """Live per-peer + aggregate WireGuard throughput (in-memory rolling window)."""
+    monitor: TrafficMonitor | None = getattr(request.app.state, "monitor", None)
+    if monitor is None:
+        return {"enabled": False, "peers": [], "aggregate": None, "pipe": None}
+    names = {pk: d.name for pk, d in _active_devices(session).items()}
+    return monitor.snapshot(
+        names=names,
+        pipe_up_mbit=settings.monitor_wan_up_mbit,
+        pipe_down_mbit=settings.monitor_wan_down_mbit,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Traffic shaping (QoS: LAN priority over WireGuard)
+# --------------------------------------------------------------------------- #
+def _shaper_defaults() -> dict:
+    return {
+        "down_mbit": int(settings.monitor_wan_down_mbit) or None,
+        "up_mbit": int(settings.monitor_wan_up_mbit) or None,
+        "lan_weight": settings.shaper_lan_weight,
+        "wg_weight": settings.shaper_wg_weight,
+    }
+
+
+@app.get("/api/shaper")
+async def api_shaper(request: Request, _: None = Depends(require_api_auth)):
+    """Current shaper scheme + shapeable firewall rules."""
+    sc = getattr(request.app.state, "shaper", None)
+    if sc is None:
+        return {"enabled": False, "configured": False, "defaults": _shaper_defaults()}
+    try:
+        state = await sc.state()
+    except PfSenseAPIError as e:
+        return {"enabled": True, "configured": False, "error": str(e),
+                "defaults": _shaper_defaults(), "rules": []}
+    state["defaults"] = _shaper_defaults()
+    return state
+
+
+@app.post("/api/shaper/setup")
+async def api_shaper_setup(
+    request: Request,
+    payload: ShaperSetup,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    sc = shaper(request)
+    try:
+        await sc.ensure_scheme(
+            down_mbit=payload.down_mbit, up_mbit=payload.up_mbit,
+            lan_weight=payload.lan_weight, wg_weight=payload.wg_weight,
+        )
+        await sc.apply()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+    audit(session, request.session["user"], "shaper_setup",
+          detail=f"down={payload.down_mbit}Mb up={payload.up_mbit}Mb "
+                 f"lan={payload.lan_weight} wg={payload.wg_weight}")
+    return await sc.state()
+
+
+@app.post("/api/shaper/ratio")
+async def api_shaper_ratio(
+    request: Request,
+    payload: ShaperRatio,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    sc = shaper(request)
+    try:
+        await sc.set_ratio(lan_weight=payload.lan_weight, wg_weight=payload.wg_weight)
+        await sc.apply()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+    audit(session, request.session["user"], "shaper_ratio",
+          detail=f"lan={payload.lan_weight} wg={payload.wg_weight}")
+    return await sc.state()
+
+
+@app.post("/api/shaper/rule")
+async def api_shaper_rule(
+    request: Request,
+    payload: ShaperRule,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    sc = shaper(request)
+    try:
+        await sc.assign_rule(payload.rule_id, payload.side)
+        await sc.apply()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+    audit(session, request.session["user"], "shaper_rule",
+          target=str(payload.rule_id), detail=f"side={payload.side}")
+    return await sc.state()
+
+
+@app.post("/api/shaper/teardown")
+async def api_shaper_teardown(
+    request: Request,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    sc = shaper(request)
+    try:
+        await sc.teardown()
+        await sc.apply()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+    audit(session, request.session["user"], "shaper_teardown")
+    return await sc.state()
 
 
 @app.get("/api/audit")

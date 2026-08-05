@@ -150,3 +150,28 @@ table.devices td > div { line-height: 1.4; }
   .result-grid { grid-template-columns: 1fr; }
   .qr { width: 180px; height: 180px; }
 }
+
+/* ---- traffic monitor ---- */
+.err-text { color: var(--danger); }
+.mon-agg { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; margin: .5rem 0 1rem; }
+.mon-agg-figs { display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; }
+.mon-fig { display: flex; flex-direction: column; gap: .1rem; }
+.mon-fig .k { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.mon-rate { font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.mon-pipe { display: grid; gap: .5rem; min-width: 240px; flex: 1; }
+.mon-bar-row { display: grid; grid-template-columns: 8.5rem 1fr auto; gap: .5rem; align-items: center; }
+.mon-bar-row .k { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.mon-bar { height: 10px; background: var(--line); border-radius: 999px; overflow: hidden; }
+.mon-bar-fill { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .5s ease; }
+.mon-bar-fill.warm { background: var(--warn); }
+.mon-bar-fill.hot { background: var(--danger); }
+.mon-table { margin-top: .25rem; }
+.mon-rate-cell { font-variant-numeric: tabular-nums; }
+.spark { display: block; overflow: visible; }
+.spark .s-down { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.spark .s-up { fill: none; stroke: var(--ok); stroke-width: 1.5; }
+
+/* ---- traffic shaping ---- */
+#sh-lan { accent-color: var(--accent); }
+#shaper-card h3 { font-size: .95rem; margin: 1rem 0 .25rem; }
+#shaper-card .v { color: var(--text); font-weight: 600; }
