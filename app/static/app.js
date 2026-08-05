@@ -386,13 +386,17 @@ async function refreshMonitor() {
 let SH_STATE = null;
 let SH_RULES = [];
 function shSideLabel(side) { return side === "lan" ? "Local" : side === "wg" ? "WG" : "none"; }
+function shLanPct() {
+  const v = parseInt($("sh-lan").value, 10);   // NB: || would turn a valid 0 into 80
+  return Number.isNaN(v) ? 80 : v;
+}
 function shSyncRatioUI() {
-  const lan = parseInt($("sh-lan").value, 10) || 1;
-  const wg = parseInt($("sh-wg").value, 10) || 1;
-  const pct = Math.round((lan / (lan + wg)) * 100);
-  $("sh-lan-val").textContent = lan + " / WG " + wg;
+  // The slider is the Local share as a percentage; WG is the remainder (sums to 100).
+  const lan = shLanPct();
+  const wg = 100 - lan;
+  $("sh-lan-val").textContent = "Local priority — Local " + lan + "% / WG " + wg + "%";
   $("sh-ratio-note").textContent =
-    "Under congestion Local gets ~" + pct + "%, WG ~" + (100 - pct) +
+    "Under congestion Local gets ~" + lan + "%, WG ~" + wg +
     "%. When local traffic is idle, WG still gets the full pipe.";
 }
 function shSideBadge(side) {
@@ -447,12 +451,14 @@ function renderShaper() {
   // Prefill without clobbering fields the user is editing.
   const down = configured ? s.down.bw_mbit : d.down_mbit;
   const up = configured ? s.up.bw_mbit : d.up_mbit;
-  const lan = configured ? (s.down.weights.lan ?? d.lan_weight) : d.lan_weight;
-  const wg = configured ? (s.down.weights.wg ?? d.wg_weight) : d.wg_weight;
+  const lanW = configured ? (s.down.weights.lan ?? d.lan_weight) : d.lan_weight;
+  const wgW = configured ? (s.down.weights.wg ?? d.wg_weight) : d.wg_weight;
   if (!$("sh-down").value && down) $("sh-down").value = down;
   if (!$("sh-up").value && up) $("sh-up").value = up;
-  if (!$("sh-wg").value && wg) $("sh-wg").value = wg;
-  if (lan) $("sh-lan").value = lan;
+  // Map the stored weights to a Local% for the slider (weights may not sum to 100).
+  if (lanW && wgW) {
+    $("sh-lan").value = Math.min(100, Math.max(0, Math.round((lanW / (lanW + wgW)) * 100)));
+  }
   shSyncRatioUI();
 
   $("sh-setup-btn").textContent = configured ? "Re-sync bandwidth" : "Set up shaping";
@@ -475,7 +481,10 @@ async function refreshShaper() {
   renderShaper();
 }
 function shReadWeights() {
-  return { lan_weight: parseInt($("sh-lan").value, 10) || 1, wg_weight: parseInt($("sh-wg").value, 10) || 1 };
+  const lan = shLanPct();  // Local %
+  // pfSense queue weights must be 1..100, so clamp each side to >=1: at 100/0 the
+  // starved side gets weight 1 (~1%), i.e. effectively all bandwidth to the other.
+  return { lan_weight: Math.max(1, lan), wg_weight: Math.max(1, 100 - lan) };
 }
 // Every shaper action does a pfSense filter-reload (apply), which takes a few
 // seconds. Show that immediately and disable the controls so it doesn't feel frozen.
@@ -852,7 +861,6 @@ $("sh-setup-btn").addEventListener("click", shSetup);
 $("sh-ratio-btn").addEventListener("click", shRatio);
 $("sh-teardown-btn").addEventListener("click", shTeardown);
 $("sh-lan").addEventListener("input", shSyncRatioUI);
-$("sh-wg").addEventListener("input", shSyncRatioUI);
 $("sh-rule-search").addEventListener("input", renderShaperRules);
 refresh();
 refreshMonitor();

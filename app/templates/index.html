@@ -260,16 +260,13 @@
         <label>WAN upload <span class="muted">(Mbit/s)</span>
           <input id="sh-up" type="number" min="1" max="1000000" style="width:8rem">
         </label>
-        <label>WG weight <span class="muted">(1–100)</span>
-          <input id="sh-wg" type="number" min="1" max="100" style="width:6rem">
-        </label>
         <button id="sh-setup-btn" type="button">Set up shaping</button>
         <button id="sh-teardown-btn" class="danger hidden" type="button">Remove</button>
       </div>
 
       <div class="row" style="align-items:center;">
-        <label class="grow">Local priority — Local weight <span id="sh-lan-val" class="v"></span>
-          <input id="sh-lan" type="range" min="1" max="100" value="80">
+        <label class="grow"><span id="sh-lan-val" class="v"></span>
+          <input id="sh-lan" type="range" min="0" max="100" value="80">
         </label>
         <button id="sh-ratio-btn" class="ghost hidden" type="button">Apply ratio</button>
       </div>
