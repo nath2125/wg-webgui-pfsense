@@ -52,6 +52,7 @@ a remote peer can then saturate the uplink no matter what the queue weights say.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -237,10 +238,13 @@ class ShaperClient:
         The first POST often comes back ``applied: false`` with the "shaper"
         subsystem still pending — limiter edits are reloaded on a later pass — so a
         single call can leave new bandwidth/weights staged but not live. Re-POST
-        until it reports done.
+        until it reports done, pausing between tries — back-to-back calls with no
+        gap keep returning "pending"; the reload needs a moment to finish.
         """
         data: dict = {}
-        for _ in range(3):
+        for attempt in range(4):
+            if attempt:
+                await asyncio.sleep(2)
             body = await self._request("POST", "/api/v2/firewall/apply", json={})
             data = body.get("data") or {}
             if data.get("applied") and not data.get("pending_subsystems"):
