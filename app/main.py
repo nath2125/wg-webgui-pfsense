@@ -246,6 +246,7 @@ async def rebuild_pf(app: FastAPI) -> None:
         ShaperClient(
             cfg_obj.pfsense_api_url,
             cfg_obj.pfsense_api_key,
+            tunnel=settings.wg_tunnel,
             verify_tls=cfg_obj.pfsense_verify_tls,
             timeout=settings.pfsense_timeout,
         )
@@ -1051,6 +1052,28 @@ async def api_shaper_rule(
     audit(session, request.session["user"], "shaper_rule",
           target=str(payload.rule_id), detail=f"side={payload.side}")
     return await sc.state()
+
+
+@app.post("/api/shaper/resync")
+async def api_shaper_resync(
+    request: Request,
+    _: None = Depends(require_api_auth),
+    __: None = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    """Repair rules whose pipes don't match their interface's direction."""
+    sc = shaper(request)
+    try:
+        changed = await sc.resync_orientation()
+        if changed:
+            await sc.apply()
+    except PfSenseAPIError as e:
+        raise HTTPException(502, f"pfSense API error: {e}") from e
+    audit(session, request.session["user"], "shaper_resync",
+          detail=f"rules_fixed={len(changed)}")
+    state = await sc.state()
+    state["resynced"] = changed
+    return state
 
 
 @app.post("/api/shaper/teardown")

@@ -30,9 +30,25 @@ Local/WG on any rule or clear it. The API has no floating "match" action, so a
 rule is the finest honest unit of control.
 
 Direction convention on a rule (see the pfSense limiter docs):
-  In pipe  (dnpipe)  = traffic entering in the rule's match direction = UPLOAD
-  Out pipe (pdnpipe) = the reverse = DOWNLOAD
-So on any interface's rule:  dnpipe -> *_up_* queue,  pdnpipe -> *_down_* queue.
+  In pipe  (dnpipe)  = traffic entering the firewall in the rule's match direction
+  Out pipe (pdnpipe) = the reverse
+
+Which of those is "upload" depends on WHICH SIDE of the firewall the rule's
+interface sits on, and getting it wrong silently disables shaping:
+
+  LAN-side rule (lan, opt1, a LAN interface group, ...)
+      In  = client -> internet          = WAN upload    -> *_up_*
+      Out = internet -> client          = WAN download  -> *_down_*
+
+  Tunnel-side rule (the WireGuard interface, e.g. tun_wg0/opt4)
+      In  = peer -> us; it reached us over the WAN inbound = WAN download -> *_down_*
+      Out = us -> peer; it leaves over the WAN outbound    = WAN upload   -> *_up_*
+
+So the tunnel interface's rules are REVERSED relative to a LAN rule. Applying the
+LAN mapping to them puts peer-bound traffic (which consumes the scarce WAN uplink)
+into the much larger download pipe, where it is effectively never throttled --
+a remote peer can then saturate the uplink no matter what the queue weights say.
+:meth:`assign_rule` resolves this per rule via :meth:`_rule_is_tunnel_side`.
 """
 from __future__ import annotations
 
@@ -55,14 +71,19 @@ def q_name(limiter: str, side: str) -> str:
     return f"{limiter}_{side}"
 
 
-def side_pipes(side: str) -> dict[str, str]:
+def side_pipes(side: str, *, tunnel_side: bool = False) -> dict[str, str]:
     """The In/Out pipe (dnpipe/pdnpipe) queue names for a side.
 
     side "lan" -> Local queues, "wg" -> WireGuard queues, "none" -> clear.
-    In pipe (dnpipe) = upload; Out pipe (pdnpipe) = download.
+
+    ``tunnel_side`` says the rule lives on the WireGuard interface, where traffic
+    flows the opposite way relative to the WAN, so In/Out swap (see module docstring).
     """
     if side in ("lan", "wg"):
-        return {"dnpipe": q_name(LIMITER_UP, side), "pdnpipe": q_name(LIMITER_DOWN, side)}
+        in_pipe, out_pipe = LIMITER_UP, LIMITER_DOWN
+        if tunnel_side:
+            in_pipe, out_pipe = LIMITER_DOWN, LIMITER_UP
+        return {"dnpipe": q_name(in_pipe, side), "pdnpipe": q_name(out_pipe, side)}
     # null (not "") is how the API clears a pipe — the field rejects empty strings.
     return {"dnpipe": None, "pdnpipe": None}
 
@@ -77,9 +98,13 @@ class ShaperClient:
         base_url: str,
         api_key: str,
         *,
+        tunnel: str,
         verify_tls: bool = False,
         timeout: float = 15.0,
     ):
+        # The WireGuard device (e.g. "tun_wg0"). Rules on the pfSense interface
+        # backed by it need the reversed pipe orientation — see side_pipes().
+        self._tunnel = tunnel
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"X-API-Key": api_key, "Accept": "application/json"},
@@ -174,6 +199,28 @@ class ShaperClient:
         data = body.get("data") or []
         return data if isinstance(data, list) else []
 
+    async def tunnel_iface_ids(self) -> set[str]:
+        """pfSense interface ids (e.g. {"opt4"}) backed by our WireGuard device."""
+        return {
+            i["id"]
+            for i in await self.list_interfaces()
+            if i.get("if") == self._tunnel and i.get("id")
+        }
+
+    @staticmethod
+    def _rule_ifaces(rule: dict) -> list[str]:
+        ifs = rule.get("interface")
+        return ifs if isinstance(ifs, list) else [ifs] if ifs else []
+
+    def _rule_is_tunnel_side(self, rule: dict, tunnel_ids: set[str]) -> bool:
+        """True if this rule matches on the WireGuard interface.
+
+        Only direct interface ids count. An interface *group* is left as LAN-side:
+        the group's members aren't in the rule object, and a group mixing the tunnel
+        with LAN interfaces has no single correct orientation anyway.
+        """
+        return any(t in tunnel_ids for t in self._rule_ifaces(rule))
+
     async def patch_rule(
         self, rule_id: int, *, dnpipe: str | None, pdnpipe: str | None
     ) -> None:
@@ -185,8 +232,25 @@ class ShaperClient:
         )
 
     async def apply(self) -> dict:
-        body = await self._request("POST", "/api/v2/firewall/apply", json={})
-        return body.get("data") or {}
+        """Apply pending changes, waiting for the shaper subsystem to clear.
+
+        The first POST often comes back ``applied: false`` with the "shaper"
+        subsystem still pending — limiter edits are reloaded on a later pass — so a
+        single call can leave new bandwidth/weights staged but not live. Re-POST
+        until it reports done.
+        """
+        data: dict = {}
+        for _ in range(3):
+            body = await self._request("POST", "/api/v2/firewall/apply", json={})
+            data = body.get("data") or {}
+            if data.get("applied") and not data.get("pending_subsystems"):
+                return data
+        if not data.get("applied"):
+            logger.warning(
+                "firewall apply still pending after retries: %s",
+                data.get("pending_subsystems"),
+            )
+        return data
 
     # ---- high-level orchestration ----
     @staticmethod
@@ -256,16 +320,57 @@ class ShaperClient:
         """
         if side not in ("lan", "wg", "none"):
             raise PfSenseAPIError(f"Unknown side {side!r}")
+
+        rule = next((r for r in await self.list_rules() if r.get("id") == rule_id), None)
+        if rule is None:
+            raise PfSenseAPIError(f"No such firewall rule: {rule_id}")
+
         if side == "none":
             # Refuse to clear a rule carrying someone else's limiter.
-            for r in await self.list_rules():
-                if r.get("id") == rule_id:
-                    ours = _our_queue_names()
-                    dn, pdn = r.get("dnpipe") or "", r.get("pdnpipe") or ""
-                    if (dn or pdn) and dn not in ours and pdn not in ours:
-                        raise PfSenseAPIError("Rule carries a different limiter; not clearing it.")
-                    break
-        await self.patch_rule(rule_id, **side_pipes(side))
+            ours = _our_queue_names()
+            dn, pdn = rule.get("dnpipe") or "", rule.get("pdnpipe") or ""
+            if (dn or pdn) and dn not in ours and pdn not in ours:
+                raise PfSenseAPIError("Rule carries a different limiter; not clearing it.")
+            await self.patch_rule(rule_id, **side_pipes("none"))
+            return
+
+        tunnel_side = self._rule_is_tunnel_side(rule, await self.tunnel_iface_ids())
+        await self.patch_rule(rule_id, **side_pipes(side, tunnel_side=tunnel_side))
+
+    async def resync_orientation(self) -> list[dict]:
+        """Re-point every rule already carrying our queues at the correct pipes.
+
+        Repairs rules attached before the orientation was interface-aware, where a
+        tunnel-side rule got the LAN mapping and so was never really shaped. Keeps
+        each rule's existing side; only the In/Out assignment can change. Returns the
+        rules that were actually changed.
+        """
+        ours_by_side = {
+            "lan": {q_name(lim, "lan") for lim in _LIMITERS},
+            "wg": {q_name(lim, "wg") for lim in _LIMITERS},
+        }
+        tunnel_ids = await self.tunnel_iface_ids()
+        changed = []
+        for rule in await self.list_rules():
+            dn, pdn = rule.get("dnpipe") or "", rule.get("pdnpipe") or ""
+            side = next(
+                (s for s, names in ours_by_side.items() if dn in names or pdn in names),
+                None,
+            )
+            if side is None:
+                continue
+            want = side_pipes(side, tunnel_side=self._rule_is_tunnel_side(rule, tunnel_ids))
+            if want["dnpipe"] == dn and want["pdnpipe"] == pdn:
+                continue
+            await self.patch_rule(rule["id"], **want)
+            changed.append({
+                "id": rule["id"],
+                "descr": rule.get("descr") or "",
+                "side": side,
+                "from": {"dnpipe": dn, "pdnpipe": pdn},
+                "to": want,
+            })
+        return changed
 
     async def teardown(self) -> None:
         """Detach any rules pointing at our queues, then delete our limiters."""
@@ -304,9 +409,12 @@ class ShaperClient:
         ours_lan = {q_name(LIMITER_UP, "lan"), q_name(LIMITER_DOWN, "lan")}
         ours_wg = {q_name(LIMITER_UP, "wg"), q_name(LIMITER_DOWN, "wg")}
         # Friendly names for interface tokens (physical); groups keep their raw name.
-        descr = {i.get("id"): i.get("descr") for i in await self.list_interfaces()}
+        ifaces = await self.list_interfaces()
+        descr = {i.get("id"): i.get("descr") for i in ifaces}
+        tunnel_ids = {i["id"] for i in ifaces if i.get("if") == self._tunnel and i.get("id")}
 
         rules = []
+        misoriented = 0
         for r in await self.list_rules():
             if r.get("type") != "pass" or r.get("floating"):
                 continue
@@ -316,8 +424,15 @@ class ShaperClient:
                 side = "lan"
             elif dn in ours_wg or pdn in ours_wg:
                 side = "wg"
-            ifs = r.get("interface")
-            ifs = ifs if isinstance(ifs, list) else [ifs] if ifs else []
+            ifs = self._rule_ifaces(r)
+            tunnel_side = self._rule_is_tunnel_side(r, tunnel_ids)
+            # Shaped rules whose pipes don't match their interface orientation are
+            # attached but not actually throttling — surfaced so the UI can say so.
+            oriented = True
+            if side is not None:
+                want = side_pipes(side, tunnel_side=tunnel_side)
+                oriented = want["dnpipe"] == dn and want["pdnpipe"] == pdn
+                misoriented += not oriented
             rules.append({
                 "id": r.get("id"),
                 "interface": ifs,
@@ -325,6 +440,8 @@ class ShaperClient:
                 "descr": r.get("descr") or "",
                 "protocol": r.get("protocol"),
                 "side": side,   # "lan" | "wg" | None
+                "tunnel_side": tunnel_side,
+                "oriented": oriented,
                 # A limiter that isn't ours — flagged so the UI won't offer to clear it.
                 "other_limiter": bool((dn or pdn) and side is None),
             })
@@ -349,4 +466,5 @@ class ShaperClient:
             },
             "rules": rules,
             "shaped_counts": shaped_counts,
+            "misoriented_count": misoriented,
         }
