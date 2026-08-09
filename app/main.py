@@ -54,6 +54,7 @@ from .schemas import (
 from .security import (
     LoginGuard,
     client_ip,
+    generate_preshared_key,
     generate_totp_secret,
     get_or_create_csrf,
     hash_password,
@@ -1451,19 +1452,17 @@ async def rotate_device(
         peer = await client.find_peer_by_pubkey(payload.public_key)
         if peer is None or peer.get("id") is None:
             raise HTTPException(404, "No matching pfSense peer to rotate.")
-        # Read the peer's preshared key before patching, while `wg show` still
-        # knows it by the old public key. The REST API never returns it, and a
-        # reissue that drops it produces a config that looks correct but can
-        # never complete a handshake — so refuse rather than guess.
-        live = (await client.wg_dump()).get(payload.public_key)
-        if live is None:
-            raise HTTPException(
-                503,
-                "pfSense is not reporting this peer on the tunnel, so its preshared "
-                "key cannot be read. Check the tunnel is up, then retry.",
-            )
-        preshared_key = live.get("preshared_key")
-        patch: dict = {"publickey": payload.new_public_key}
+        # Issue a fresh preshared key rather than carrying the old one over. The API
+        # redacts the PSK on every endpoint (the field is `sensitive`), so reading it
+        # back would mean running `wg show` through the root-shell diagnostics
+        # endpoint. Writes are accepted though, so both ends get a new PSK from this
+        # one config instead — the device is already being re-keyed here, so it has to
+        # take the new config either way. Peers that had no PSK gain one.
+        preshared_key = generate_preshared_key()
+        patch: dict = {
+            "publickey": payload.new_public_key,
+            "presharedkey": preshared_key,
+        }
         # Peers created before keepalive was set (or imported ones) have none, which
         # leaves them unable to re-establish on their own after a tunnel apply.
         # Re-issuing is the natural moment to bring them up to the configured value.

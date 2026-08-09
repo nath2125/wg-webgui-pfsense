@@ -92,6 +92,14 @@ class LoginGuard:
 
 
 # --------------------------------------------------------------------------- #
+# WireGuard preshared keys
+# --------------------------------------------------------------------------- #
+def generate_preshared_key() -> str:
+    """A WireGuard PSK: 32 random bytes, standard base64 — same shape as `wg genpsk`."""
+    return base64.b64encode(secrets.token_bytes(32)).decode()
+
+
+# --------------------------------------------------------------------------- #
 # TOTP 2FA (RFC 6238, HMAC-SHA1, 6 digits, 30s) — stdlib only
 # --------------------------------------------------------------------------- #
 def generate_totp_secret() -> str:

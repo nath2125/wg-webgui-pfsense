@@ -20,7 +20,7 @@ the pfSense **WireGuard package** through the **pfSense REST API**
 - **See everything, live** — a tunnel **dashboard** (pool usage, peer counts, online now)
   plus a merged peer list showing **every** peer on the tunnel, marked *created here* /
   *imported* / *unmanaged*, each with **live handshake / online state and transfer**
-  read from `wg show` on pfSense.
+  read from the pfSense WireGuard status API.
 - **Edit in place** — rename a peer and adjust its pfSense routed subnets (AllowedIPs) and
   expiry without recreating it.
 - **Import & export** — adopt pre-existing pfSense peers into the registry to name/track
@@ -56,9 +56,9 @@ Verified live against a real box, these are the shapes this app uses (all in
 - `GET  /api/v2/vpn/wireguard/peers?limit=0`  ·  `GET /api/v2/vpn/wireguard/tunnels?limit=0`
 - `DELETE /api/v2/vpn/wireguard/peer?id=<int>&apply=`
 - `POST /api/v2/vpn/wireguard/apply`  ·  envelope `{code, status, message, data, _links}`
-- `POST /api/v2/diagnostics/command_prompt` — runs `wg show <tunnel> dump` for live
-  handshake/transfer status. **Optional**: if the API key lacks this privilege the app still
-  works; peers just show no live status.
+- `GET  /api/v2/status/wireguard/peers?limit=0` — live handshake/transfer counters, filtered
+  on `tunnel_device`. Needs REST API package **v2.9.0+**. **Optional**: if the API key lacks
+  this privilege the app still works; peers just show no live status.
 
 ---
 
@@ -81,6 +81,11 @@ it holds an API credential into your firewall and assumes no public exposure. Wh
 HTTPS, set `SESSION_HTTPS_ONLY=true` and `ENABLE_HSTS=true`.
 
 ### First-run setup wizard
+
+> **Before you start:** create a dedicated pfSense service account for this app instead of
+> using an `admin` key — see **[`docs/PFSENSE-SETUP.md`](docs/PFSENSE-SETUP.md)** for the
+> exact user, privileges and API key to create. An admin key works, but it makes a leak of
+> this app's `.env` a full firewall compromise.
 
 Log in, then the app sends you to **`/setup`**:
 
@@ -148,9 +153,11 @@ hash is better.
   peers, so a peer AllowedIP covering the tunnel pool (or `0.0.0.0/0`) would silently steal
   the return path for every other peer and black-hole them. Entries that overlap the pool are
   rejected on both add and edit; subnets genuinely behind a peer never overlap it.
-- **No shell metacharacters reach pfSense** — the tunnel name is interpolated into a `wg show`
-  command that the pfSense diagnostics endpoint runs as root, so it is restricted to
-  `[A-Za-z0-9_.-]` at the wizard boundary *and* re-validated immediately before use.
+- **Nothing this app does reaches a shell** — live peer status comes from the WireGuard
+  status API, not `wg show` via the root-level diagnostics endpoint, so the recommended
+  service account never needs shell-command privilege on the firewall. The tunnel name is
+  still restricted to `[A-Za-z0-9_.-]` at the wizard boundary so no future caller can
+  reintroduce that path. See [`docs/PFSENSE-SETUP.md`](docs/PFSENSE-SETUP.md).
 - **API docs are off by default** — `/docs`, `/redoc` and `/openapi.json` can't be auth-gated
   the way routes are, so they stay unmounted unless `ENABLE_API_DOCS` is set.
 - **The registry is `0600`** — SQLite would otherwise create it with the process umask.

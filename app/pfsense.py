@@ -22,9 +22,10 @@ import httpx
 
 logger = logging.getLogger("pfsense")
 
-# A pfSense WireGuard tunnel is always "tun_wgN"-shaped. The name reaches a shell
-# command in wg_dump(), and the diagnostics endpoint runs commands as root on the
-# firewall, so anything outside this charset is rejected rather than escaped.
+# A pfSense WireGuard tunnel is always "tun_wgN"-shaped. The name is settable through
+# the setup wizard and is still validated on the way in: it is no longer interpolated
+# into a shell command, but run_command() remains available and the constraint keeps
+# any future caller from reintroducing that hazard.
 _TUNNEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 
 
@@ -161,8 +162,14 @@ class PfSenseClient:
             params={"id": peer_id, "apply": str(apply).lower()},
         )
 
-    # ---- live status (via diagnostics command) ----
+    # ---- live status ----
     async def run_command(self, command: str) -> tuple[int, str]:
+        """Run a shell command on the firewall.
+
+        pfSense executes this as root, so the API key needs
+        `api-v2-diagnostics-command-prompt-post` — effectively full control of the
+        appliance. Nothing on the read path uses this any more; keep it that way.
+        """
         body = await self._request(
             "POST", "/api/v2/diagnostics/command_prompt", json={"command": command}
         )
@@ -170,29 +177,32 @@ class PfSenseClient:
         return data.get("result_code", -1), data.get("output", "")
 
     async def wg_dump(self) -> dict[str, dict]:
-        """Return {public_key: {latest_handshake, rx, tx, endpoint, preshared_key}}.
+        """Return {public_key: {latest_handshake, rx, tx, endpoint}} for this tunnel.
 
-        The preshared key is only reachable this way: the REST API omits it from
-        the peer objects entirely, so `wg show` is the one source we have for it.
+        Sourced from /api/v2/status/wireguard/peers (REST API pkg >= v2.9.0), which
+        reports the same counters `wg show <tun> dump` does without needing the
+        root-shell diagnostics endpoint.
 
-        The tunnel name is interpolated into a command that pfSense runs as root,
-        and it is settable through the setup wizard, so it is re-validated here
-        rather than trusted — this is the last gate before the shell.
+        Note this does NOT carry the preshared key: the status model marks that field
+        `sensitive`, so the API redacts it. Callers that need the PSK must get it
+        elsewhere — see the reissue path in main.py.
         """
-        if not valid_tunnel_name(self.tunnel):
-            raise PfSenseAPIError(f"Refusing to run a command for unsafe tunnel name: {self.tunnel!r}")
-        _, out = await self.run_command(f"wg show {self.tunnel} dump")
+        body = await self._request(
+            "GET", "/api/v2/status/wireguard/peers", params={"limit": 0}
+        )
         peers: dict[str, dict] = {}
-        for line in out.strip().splitlines():
-            f = line.split("\t")
-            if len(f) < 8:  # the first line is the interface itself
+        for p in body.get("data") or []:
+            if p.get("tunnel_device") != self.tunnel:
                 continue
-            peers[f[0]] = {
-                "latest_handshake": int(f[4]) if f[4].isdigit() else 0,
-                "rx": int(f[5]) if f[5].isdigit() else 0,
-                "tx": int(f[6]) if f[6].isdigit() else 0,
-                "endpoint": None if f[2] in ("(none)", "") else f[2],
-                "preshared_key": None if f[1] in ("(none)", "") else f[1],
+            pk = p.get("public_key")
+            if not pk:
+                continue
+            endpoint = p.get("endpoint")
+            peers[pk] = {
+                "latest_handshake": p.get("latest_handshake") or 0,
+                "rx": p.get("transfer_rx") or 0,
+                "tx": p.get("transfer_tx") or 0,
+                "endpoint": endpoint if endpoint not in ("(none)", "") else None,
             }
         return peers
 
