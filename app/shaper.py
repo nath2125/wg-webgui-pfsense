@@ -66,6 +66,30 @@ LIMITER_DOWN = "wgweb_down"
 LIMITER_UP = "wgweb_up"
 _LIMITERS = (LIMITER_DOWN, LIMITER_UP)
 
+# Per-host queue masking. Without a mask a queue is ONE shared FIFO: a single bulk
+# transfer keeps it permanently full and everything else sharing it (pings, DNS,
+# SSH) is tail-dropped. Measured 2026-08-12 — an offsite backup pinned the up pipe
+# at its 92 Mbit ceiling and ICMP to that peer lost ~20%, while the same host pinged
+# from pfSense (which bypasses these rules, and so the queue) lost 0/150. Masking
+# gives each host its own dynamic sub-queue of the same pipe, so flows share the
+# bandwidth instead of queueing behind each other.
+#
+# The mask has to key on the LAN-side host in BOTH directions, so it differs per
+# limiter:
+#     *_up_*    carries LAN host -> peer/internet   -> LAN host is the SOURCE
+#     *_down_*  carries peer/internet -> LAN host   -> LAN host is the DESTINATION
+#
+# This belongs on the QUEUES only. Masking the parent pipe would hand every host its
+# own full-bandwidth pipe and remove the WAN cap altogether.
+QUEUE_MASKBITS = 32
+# dummynet's default queue depth (~50 slots) is too shallow and tail-drops bursts.
+QUEUE_QLIMIT = 300
+
+
+def queue_mask(limiter: str) -> str:
+    """Which address a limiter's child queues key their sub-queues on."""
+    return "srcaddress" if limiter == LIMITER_UP else "dstaddress"
+
 
 def q_name(limiter: str, side: str) -> str:
     """Queue name for a limiter + side ("lan" | "wg")."""
@@ -167,7 +191,9 @@ class ShaperClient:
             json={"parent_id": parent_id, "id": q_id, "weight": weight},
         )
 
-    async def _create_queue(self, parent_id: int, name: str, weight: int) -> None:
+    async def _create_queue(
+        self, parent_id: int, limiter: str, name: str, weight: int
+    ) -> None:
         # aqm MUST be "droptail": the package's queue model has an `ecn` field whose
         # condition references a non-existent `sched` field, and any AQM in
         # [codel,pie,red,gred] trips that broken condition. droptail avoids it.
@@ -177,7 +203,26 @@ class ShaperClient:
             "POST",
             "/api/v2/firewall/traffic_shaper/limiter/queue",
             json={"parent_id": parent_id, "name": name, "enabled": True,
-                  "aqm": "droptail", "mask": "none", "weight": weight},
+                  "aqm": "droptail", "mask": queue_mask(limiter),
+                  "maskbits": QUEUE_MASKBITS, "qlimit": QUEUE_QLIMIT,
+                  "weight": weight},
+        )
+
+    async def _patch_queue_shape(
+        self, parent_id: int, limiter: str, q_id: int, weight: int
+    ) -> None:
+        """Set an existing queue's weight and (re)assert its mask + qlimit.
+
+        Deployments created before per-host masking have ``mask: none`` and no
+        ``qlimit``; asserting both here repairs them in place on the next
+        ensure_scheme() instead of needing the limiters rebuilt.
+        """
+        await self._request(
+            "PATCH",
+            "/api/v2/firewall/traffic_shaper/limiter/queue",
+            json={"parent_id": parent_id, "id": q_id, "weight": weight,
+                  "mask": queue_mask(limiter), "maskbits": QUEUE_MASKBITS,
+                  "qlimit": QUEUE_QLIMIT},
         )
 
     async def delete_limiter(self, limiter_id: int) -> None:
@@ -296,9 +341,9 @@ class ShaperClient:
                 qn = q_name(name, side)
                 q = by_name.get(qn)
                 if q is None:
-                    await self._create_queue(parent_id, qn, weight)
+                    await self._create_queue(parent_id, name, qn, weight)
                 else:
-                    await self._patch_queue_weight(parent_id, q["id"], weight)
+                    await self._patch_queue_shape(parent_id, name, q["id"], weight)
 
     async def set_ratio(self, *, lan_weight: int, wg_weight: int) -> None:
         """Update only the queue weights on the existing limiters."""
