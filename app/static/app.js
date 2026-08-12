@@ -385,7 +385,9 @@ async function refreshMonitor() {
 // ---- traffic shaping (QoS) ----
 let SH_STATE = null;
 let SH_RULES = [];
-function shSideLabel(side) { return side === "lan" ? "Local" : side === "wg" ? "WG" : "none"; }
+function shSideLabel(side) {
+  return side === "lan" ? "Local" : side === "wg" ? "WG" : side === "bulk" ? "Bulk" : "none";
+}
 function shLanPct() {
   const v = parseInt($("sh-lan").value, 10);   // NB: || would turn a valid 0 into 80
   return Number.isNaN(v) ? 80 : v;
@@ -402,6 +404,7 @@ function shSyncRatioUI() {
 function shSideBadge(side) {
   if (side === "lan") return "<span class='badge ok'>Local</span>";
   if (side === "wg") return "<span class='badge warn'>WG</span>";
+  if (side === "bulk") return "<span class='badge muted'>Bulk</span>";
   return "<span class='muted'>—</span>";
 }
 function renderShaperRules() {
@@ -430,6 +433,7 @@ function renderShaperRules() {
     } else {
       if (r.side !== "lan") cell.appendChild(mkBtn("Local", "ghost small", () => shAssignRule(r.id, "lan")));
       if (r.side !== "wg") cell.appendChild(mkBtn("WG", "ghost small", () => shAssignRule(r.id, "wg")));
+      if (r.side !== "bulk") cell.appendChild(mkBtn("Bulk", "ghost small", () => shAssignRule(r.id, "bulk")));
       if (r.side) cell.appendChild(mkBtn("Detach", "danger small", () => shAssignRule(r.id, "none")));
     }
     tbody.appendChild(tr);

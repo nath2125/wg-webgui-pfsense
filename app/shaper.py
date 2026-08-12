@@ -85,6 +85,22 @@ QUEUE_MASKBITS = 32
 # dummynet's default queue depth (~50 slots) is too shallow and tail-drops bursts.
 QUEUE_QLIMIT = 300
 
+# The three shaping classes, in priority order. "lan" and "wg" split the pipe by the
+# user's ratio dial; "bulk" is a fixed low weight for background site-to-site transfer
+# (offsite backups, file sync) that should yield to everything else.
+#
+# Bulk exists because backups and interactive VPN use have opposite needs: a backup
+# only cares about finishing, a phone on VPN cares about latency, and at equal weight
+# the backup wins simply by always having more to send. Weights are relative and only
+# apply under contention, so an idle link still lets a backup run at full pipe speed.
+SIDE_LAN = "lan"
+SIDE_WG = "wg"
+SIDE_BULK = "bulk"
+SIDES = (SIDE_LAN, SIDE_WG, SIDE_BULK)
+# Not user-tunable: the ratio dial governs lan-vs-wg, and bulk deliberately sits below
+# both. wf2q+ accepts 1-100; 5 against a 70/30 split is ~5% under full contention.
+BULK_WEIGHT = 5
+
 
 def queue_mask(limiter: str) -> str:
     """Which address a limiter's child queues key their sub-queues on."""
@@ -92,19 +108,20 @@ def queue_mask(limiter: str) -> str:
 
 
 def q_name(limiter: str, side: str) -> str:
-    """Queue name for a limiter + side ("lan" | "wg")."""
+    """Queue name for a limiter + side ("lan" | "wg" | "bulk")."""
     return f"{limiter}_{side}"
 
 
 def side_pipes(side: str, *, tunnel_side: bool = False) -> dict[str, str]:
     """The In/Out pipe (dnpipe/pdnpipe) queue names for a side.
 
-    side "lan" -> Local queues, "wg" -> WireGuard queues, "none" -> clear.
+    side "lan" -> Local queues, "wg" -> WireGuard queues, "bulk" -> background
+    site-to-site queues, "none" -> clear.
 
     ``tunnel_side`` says the rule lives on the WireGuard interface, where traffic
     flows the opposite way relative to the WAN, so In/Out swap (see module docstring).
     """
-    if side in ("lan", "wg"):
+    if side in SIDES:
         in_pipe, out_pipe = LIMITER_UP, LIMITER_DOWN
         if tunnel_side:
             in_pipe, out_pipe = LIMITER_DOWN, LIMITER_UP
@@ -114,7 +131,7 @@ def side_pipes(side: str, *, tunnel_side: bool = False) -> dict[str, str]:
 
 
 def _our_queue_names() -> set[str]:
-    return {q_name(lim, side) for lim in _LIMITERS for side in ("lan", "wg")}
+    return {q_name(lim, side) for lim in _LIMITERS for side in SIDES}
 
 
 class ShaperClient:
@@ -325,7 +342,7 @@ class ShaperClient:
         weight of any queue already there, and creates any queue that's missing —
         never deleting/replacing queues (that could break rules referencing them).
         """
-        weights = {"lan": lan_weight, "wg": wg_weight}
+        weights = {SIDE_LAN: lan_weight, SIDE_WG: wg_weight, SIDE_BULK: BULK_WEIGHT}
         for name, bw in ((LIMITER_DOWN, down_mbit), (LIMITER_UP, up_mbit)):
             existing = await self.get_limiter(name)
             if existing is None:
@@ -353,11 +370,13 @@ class ShaperClient:
                 await self._apply_weights(lim, lan_weight, wg_weight)
 
     async def _apply_weights(self, limiter: dict, lan_weight: int, wg_weight: int) -> None:
+        # The ratio dial governs lan-vs-wg only; the bulk queue keeps BULK_WEIGHT and
+        # is deliberately left untouched here.
         parent_id = limiter["id"]
         for q in limiter.get("queue") or []:
-            if q.get("name", "").endswith("_lan"):
+            if q.get("name", "").endswith(f"_{SIDE_LAN}"):
                 await self._patch_queue_weight(parent_id, q["id"], lan_weight)
-            elif q.get("name", "").endswith("_wg"):
+            elif q.get("name", "").endswith(f"_{SIDE_WG}"):
                 await self._patch_queue_weight(parent_id, q["id"], wg_weight)
 
     async def assign_rule(self, rule_id: int, side: str) -> None:
@@ -367,7 +386,7 @@ class ShaperClient:
         rules (which may be per-interface, on an interface group, or source-aliased),
         so the UI shows and edits exactly the rules that carry our limiters.
         """
-        if side not in ("lan", "wg", "none"):
+        if side not in (*SIDES, "none"):
             raise PfSenseAPIError(f"Unknown side {side!r}")
 
         rule = next((r for r in await self.list_rules() if r.get("id") == rule_id), None)
@@ -395,8 +414,7 @@ class ShaperClient:
         rules that were actually changed.
         """
         ours_by_side = {
-            "lan": {q_name(lim, "lan") for lim in _LIMITERS},
-            "wg": {q_name(lim, "wg") for lim in _LIMITERS},
+            s: {q_name(lim, s) for lim in _LIMITERS} for s in SIDES
         }
         tunnel_ids = await self.tunnel_iface_ids()
         changed = []
@@ -455,8 +473,7 @@ class ShaperClient:
                 return b.get("bw")
             return None
 
-        ours_lan = {q_name(LIMITER_UP, "lan"), q_name(LIMITER_DOWN, "lan")}
-        ours_wg = {q_name(LIMITER_UP, "wg"), q_name(LIMITER_DOWN, "wg")}
+        ours_by_side = {s: {q_name(lim, s) for lim in _LIMITERS} for s in SIDES}
         # Friendly names for interface tokens (physical); groups keep their raw name.
         ifaces = await self.list_interfaces()
         descr = {i.get("id"): i.get("descr") for i in ifaces}
@@ -468,11 +485,10 @@ class ShaperClient:
             if r.get("type") != "pass" or r.get("floating"):
                 continue
             dn, pdn = r.get("dnpipe") or "", r.get("pdnpipe") or ""
-            side = None
-            if dn in ours_lan or pdn in ours_lan:
-                side = "lan"
-            elif dn in ours_wg or pdn in ours_wg:
-                side = "wg"
+            side = next(
+                (s for s, names in ours_by_side.items() if dn in names or pdn in names),
+                None,
+            )
             ifs = self._rule_ifaces(r)
             tunnel_side = self._rule_is_tunnel_side(r, tunnel_ids)
             # Shaped rules whose pipes don't match their interface orientation are

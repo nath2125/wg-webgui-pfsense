@@ -335,7 +335,7 @@ class ShaperRatio(BaseModel):
 class ShaperRule(BaseModel):
     """Assign one firewall rule to a shaping side."""
     rule_id: int
-    side: str  # "lan" (Local) | "wg" | "none"
+    side: str  # "lan" (Local) | "wg" | "bulk" (background site-to-site) | "none"
 
     @field_validator("rule_id")
     @classmethod
@@ -347,6 +347,6 @@ class ShaperRule(BaseModel):
     @field_validator("side")
     @classmethod
     def _check_side(cls, v: str) -> str:
-        if v not in ("lan", "wg", "none"):
-            raise ValueError("side must be 'lan', 'wg', or 'none'.")
+        if v not in ("lan", "wg", "bulk", "none"):
+            raise ValueError("side must be 'lan', 'wg', 'bulk', or 'none'.")
         return v
