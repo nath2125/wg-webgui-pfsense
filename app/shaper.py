@@ -44,11 +44,23 @@ interface sits on, and getting it wrong silently disables shaping:
       In  = peer -> us; it reached us over the WAN inbound = WAN download -> *_down_*
       Out = us -> peer; it leaves over the WAN outbound    = WAN upload   -> *_up_*
 
-So the tunnel interface's rules are REVERSED relative to a LAN rule. Applying the
-LAN mapping to them puts peer-bound traffic (which consumes the scarce WAN uplink)
+  WAN-side rule (an inbound port-forward / reverse-proxy pass rule on wan)
+      In  = internet -> us                                = WAN download -> *_down_*
+      Out = us -> internet                                = WAN upload   -> *_up_*
+
+So tunnel AND WAN rules are both REVERSED relative to a LAN rule. Applying the LAN
+mapping to them puts internet-bound traffic (which consumes the scarce WAN uplink)
 into the much larger download pipe, where it is effectively never throttled --
 a remote peer can then saturate the uplink no matter what the queue weights say.
-:meth:`assign_rule` resolves this per rule via :meth:`_rule_is_tunnel_side`.
+:meth:`assign_rule` resolves this per rule via :meth:`_rule_is_reversed`.
+
+Why WAN rules matter at all: a pf state pins its limiters at creation time and the
+reply direction is never re-evaluated, so a flow the *internet* opened (a remote
+client streaming off a LAN server via the reverse proxy) is shaped only if the WAN
+rule that admitted it carries a queue. Leave those rules bare and that traffic sits
+outside dummynet entirely -- and since wf2q+ can only arbitrate flows inside the
+same pipe, the WireGuard queue has nothing to yield to and takes the whole uplink
+no matter how low its weight is.
 """
 from __future__ import annotations
 
@@ -112,18 +124,19 @@ def q_name(limiter: str, side: str) -> str:
     return f"{limiter}_{side}"
 
 
-def side_pipes(side: str, *, tunnel_side: bool = False) -> dict[str, str]:
+def side_pipes(side: str, *, reversed_dir: bool = False) -> dict[str, str]:
     """The In/Out pipe (dnpipe/pdnpipe) queue names for a side.
 
     side "lan" -> Local queues, "wg" -> WireGuard queues, "bulk" -> background
     site-to-site queues, "none" -> clear.
 
-    ``tunnel_side`` says the rule lives on the WireGuard interface, where traffic
-    flows the opposite way relative to the WAN, so In/Out swap (see module docstring).
+    ``reversed_dir`` says the rule lives on the WireGuard or the WAN interface, where
+    traffic flows the opposite way relative to a LAN rule, so In/Out swap (see the
+    module docstring).
     """
     if side in SIDES:
         in_pipe, out_pipe = LIMITER_UP, LIMITER_DOWN
-        if tunnel_side:
+        if reversed_dir:
             in_pipe, out_pipe = LIMITER_DOWN, LIMITER_UP
         return {"dnpipe": q_name(in_pipe, side), "pdnpipe": q_name(out_pipe, side)}
     # null (not "") is how the API clears a pipe — the field rejects empty strings.
@@ -132,6 +145,22 @@ def side_pipes(side: str, *, tunnel_side: bool = False) -> dict[str, str]:
 
 def _our_queue_names() -> set[str]:
     return {q_name(lim, side) for lim in _LIMITERS for side in SIDES}
+
+
+# Address types that only ever describe an uplink, used to spot secondary WANs.
+# The primary WAN is always id "wan"; extra ones are optN and are told apart by
+# either a dynamic uplink type or a static gateway. (A DHCP WAN reports gateway ""
+# because its gateway is dynamic, so the type check has to come first.)
+_WAN_ADDR_TYPES = {"dhcp", "pppoe", "pptp", "l2tp", "ppp"}
+
+
+def _is_wan_iface(iface: dict) -> bool:
+    """Whether a pfSense interface object is an internet uplink."""
+    if iface.get("id") == "wan":
+        return True
+    if iface.get("typev4") in _WAN_ADDR_TYPES or iface.get("typev6") in _WAN_ADDR_TYPES:
+        return True
+    return bool(iface.get("gateway") or iface.get("gatewayv6"))
 
 
 class ShaperClient:
@@ -262,27 +291,35 @@ class ShaperClient:
         data = body.get("data") or []
         return data if isinstance(data, list) else []
 
-    async def tunnel_iface_ids(self) -> set[str]:
-        """pfSense interface ids (e.g. {"opt4"}) backed by our WireGuard device."""
-        return {
-            i["id"]
-            for i in await self.list_interfaces()
-            if i.get("if") == self._tunnel and i.get("id")
-        }
+    async def reversed_iface_ids(self) -> set[str]:
+        """Interface ids whose rules run reversed relative to a LAN rule.
+
+        That is our WireGuard device's ids (e.g. {"opt4"}) plus every WAN-typed
+        interface. Both sit on the far side of the firewall from a LAN client, so
+        their In/Out pipes swap — see the module docstring.
+        """
+        ids = set()
+        for i in await self.list_interfaces():
+            iid = i.get("id")
+            if not iid:
+                continue
+            if i.get("if") == self._tunnel or _is_wan_iface(i):
+                ids.add(iid)
+        return ids
 
     @staticmethod
     def _rule_ifaces(rule: dict) -> list[str]:
         ifs = rule.get("interface")
         return ifs if isinstance(ifs, list) else [ifs] if ifs else []
 
-    def _rule_is_tunnel_side(self, rule: dict, tunnel_ids: set[str]) -> bool:
-        """True if this rule matches on the WireGuard interface.
+    def _rule_is_reversed(self, rule: dict, reversed_ids: set[str]) -> bool:
+        """True if this rule's In/Out pipes must swap (WireGuard- or WAN-side).
 
         Only direct interface ids count. An interface *group* is left as LAN-side:
         the group's members aren't in the rule object, and a group mixing the tunnel
-        with LAN interfaces has no single correct orientation anyway.
+        or a WAN with LAN interfaces has no single correct orientation anyway.
         """
-        return any(t in tunnel_ids for t in self._rule_ifaces(rule))
+        return any(t in reversed_ids for t in self._rule_ifaces(rule))
 
     async def patch_rule(
         self, rule_id: int, *, dnpipe: str | None, pdnpipe: str | None
@@ -402,21 +439,21 @@ class ShaperClient:
             await self.patch_rule(rule_id, **side_pipes("none"))
             return
 
-        tunnel_side = self._rule_is_tunnel_side(rule, await self.tunnel_iface_ids())
-        await self.patch_rule(rule_id, **side_pipes(side, tunnel_side=tunnel_side))
+        rev = self._rule_is_reversed(rule, await self.reversed_iface_ids())
+        await self.patch_rule(rule_id, **side_pipes(side, reversed_dir=rev))
 
     async def resync_orientation(self) -> list[dict]:
         """Re-point every rule already carrying our queues at the correct pipes.
 
         Repairs rules attached before the orientation was interface-aware, where a
-        tunnel-side rule got the LAN mapping and so was never really shaped. Keeps
-        each rule's existing side; only the In/Out assignment can change. Returns the
-        rules that were actually changed.
+        tunnel- or WAN-side rule got the LAN mapping and so was never really shaped.
+        Keeps each rule's existing side; only the In/Out assignment can change.
+        Returns the rules that were actually changed.
         """
         ours_by_side = {
             s: {q_name(lim, s) for lim in _LIMITERS} for s in SIDES
         }
-        tunnel_ids = await self.tunnel_iface_ids()
+        reversed_ids = await self.reversed_iface_ids()
         changed = []
         for rule in await self.list_rules():
             dn, pdn = rule.get("dnpipe") or "", rule.get("pdnpipe") or ""
@@ -426,7 +463,7 @@ class ShaperClient:
             )
             if side is None:
                 continue
-            want = side_pipes(side, tunnel_side=self._rule_is_tunnel_side(rule, tunnel_ids))
+            want = side_pipes(side, reversed_dir=self._rule_is_reversed(rule, reversed_ids))
             if want["dnpipe"] == dn and want["pdnpipe"] == pdn:
                 continue
             await self.patch_rule(rule["id"], **want)
@@ -477,7 +514,11 @@ class ShaperClient:
         # Friendly names for interface tokens (physical); groups keep their raw name.
         ifaces = await self.list_interfaces()
         descr = {i.get("id"): i.get("descr") for i in ifaces}
-        tunnel_ids = {i["id"] for i in ifaces if i.get("if") == self._tunnel and i.get("id")}
+        reversed_ids = {
+            i["id"]
+            for i in ifaces
+            if i.get("id") and (i.get("if") == self._tunnel or _is_wan_iface(i))
+        }
 
         rules = []
         misoriented = 0
@@ -490,12 +531,12 @@ class ShaperClient:
                 None,
             )
             ifs = self._rule_ifaces(r)
-            tunnel_side = self._rule_is_tunnel_side(r, tunnel_ids)
+            rev = self._rule_is_reversed(r, reversed_ids)
             # Shaped rules whose pipes don't match their interface orientation are
             # attached but not actually throttling — surfaced so the UI can say so.
             oriented = True
             if side is not None:
-                want = side_pipes(side, tunnel_side=tunnel_side)
+                want = side_pipes(side, reversed_dir=rev)
                 oriented = want["dnpipe"] == dn and want["pdnpipe"] == pdn
                 misoriented += not oriented
             rules.append({
@@ -505,7 +546,7 @@ class ShaperClient:
                 "descr": r.get("descr") or "",
                 "protocol": r.get("protocol"),
                 "side": side,   # "lan" | "wg" | None
-                "tunnel_side": tunnel_side,
+                "reversed_dir": rev,
                 "oriented": oriented,
                 # A limiter that isn't ours — flagged so the UI won't offer to clear it.
                 "other_limiter": bool((dn or pdn) and side is None),
