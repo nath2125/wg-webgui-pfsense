@@ -248,9 +248,9 @@
       </div>
       <p class="muted small">
         Prioritises <strong>Local</strong> traffic — your LAN and all VLANs, i.e. anything
-        local heading out — over external WireGuard peers on the WAN uplink under congestion.
-        WG peers still get the full pipe when local traffic is idle. Manages its own
-        limiters/queues only.
+        local heading out — over the <strong>WG</strong> class on the WAN uplink under
+        congestion. WG still gets the full pipe when local traffic is idle. Manages its
+        own limiters/queues only.
       </p>
 
       <div class="row">
@@ -280,8 +280,16 @@
         </div>
         <p class="muted small">
           The rules below currently carry the limiters — this is the real status. Set any rule to
-          <strong>Local</strong> or <strong>WG</strong>, or detach it. Search to find other pass
-          rules to add (e.g. your internet-out rules: local subnets → Local, WireGuard → WG).
+          <strong>Local</strong>, <strong>WG</strong> or <strong>Bulk</strong>, or detach it.
+          Search to find other pass rules to add — including inbound WAN rules (a port forward or
+          reverse proxy), which are the only place traffic the internet initiated can be shaped.
+        </p>
+        <p class="muted small">
+          <strong>WG</strong> is the class you want held back, not every rule that touches
+          WireGuard. Put always-on site-to-site endpoints (an offsite backup node and its VMs)
+          there; leave interactive peers — a phone or laptop on the VPN — on <strong>Local</strong>,
+          since throttling them costs latency without freeing real bandwidth. <strong>Bulk</strong>
+          sits below both for transfers that should yield to everything.
         </p>
         <table class="devices">
           <thead>

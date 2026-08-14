@@ -399,7 +399,9 @@ function shSyncRatioUI() {
   $("sh-lan-val").textContent = "Local priority — Local " + lan + "% / WG " + wg + "%";
   $("sh-ratio-note").textContent =
     "Under congestion Local gets ~" + lan + "%, WG ~" + wg +
-    "%. When local traffic is idle, WG still gets the full pipe.";
+    "%. When local traffic is idle, WG still gets the full pipe. " +
+    "Applying recreates the limiters — the only way a weight change takes effect — " +
+    "so it takes a moment and resets existing connections to the new weights.";
 }
 function shSideBadge(side) {
   if (side === "lan") return "<span class='badge ok'>Local</span>";

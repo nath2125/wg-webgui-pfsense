@@ -6,22 +6,32 @@ client and its own ``/api/shaper`` surface.
 
 What it manages (and ONLY this — it never rewrites objects it didn't create):
 
-  Two limiters, one per direction, each a single shared pipe with two weighted
+  Two limiters, one per direction, each a single shared pipe with three weighted
   child queues::
 
       wgweb_down  (bw = WAN download Mbit/s, sched wf2q+)
-        ├─ wgweb_down_lan   weight = LAN   (e.g. 100)
-        └─ wgweb_down_wg    weight = WG    (e.g. 5)
+        ├─ wgweb_down_lan    weight = LAN  (e.g. 70)
+        ├─ wgweb_down_wg     weight = WG   (e.g. 30)
+        └─ wgweb_down_bulk   weight = 5
       wgweb_up    (bw = WAN upload  Mbit/s, sched wf2q+)
-        ├─ wgweb_up_lan     weight = LAN
-        └─ wgweb_up_wg      weight = WG
+        ├─ wgweb_up_lan      weight = LAN
+        ├─ wgweb_up_wg       weight = WG
+        └─ wgweb_up_bulk     weight = 5
 
 ``sched = wf2q+`` is what makes the weights bite: fq_codel would ignore them and
 flow-hash instead. Queues use ``aqm = droptail`` — not codel — because the REST
 package's queue model has a broken ``ecn`` condition that references a ``sched``
 field the queue doesn't have, and every other AQM trips it (see _create_queue).
-Weights only matter under congestion — when local traffic is idle, WG still gets
-the whole pipe.
+Weights only matter under congestion — when local traffic is idle, the WG class
+still gets the whole pipe.
+
+⚠ A queue's weight/mask/qlimit CANNOT be changed in place. PATCHing them is
+accepted, reported back correctly by the API, and applied without error — while
+dummynet carries on scheduling with the previous values, so the weights the API
+reports are not the weights in force. Only deleting and recreating the limiters
+instantiates new ones, which is why :meth:`set_ratio` rebuilds instead of
+patching (see :meth:`rebuild`). Pipe *bandwidth* is the exception: it does take
+effect in place, immediately, even on established states.
 
 Attachment is per-rule (:meth:`assign_rule`): pfSense shaping lives on firewall
 rules (per-interface, on an interface group, or source-aliased), so the UI shows
@@ -101,6 +111,14 @@ QUEUE_QLIMIT = 300
 # user's ratio dial; "bulk" is a fixed low weight for background site-to-site transfer
 # (offsite backups, file sync) that should yield to everything else.
 #
+# "wg" is NOT "every rule touching WireGuard" — it is the class you want held back
+# under contention, which in practice means the always-on site-to-site endpoints (an
+# offsite backup node and its VMs). Interactive peers — a phone or laptop on the VPN —
+# belong in "lan": they are latency-sensitive, low-volume, and want the same priority
+# as a local client, so putting them in the throttled class only makes them feel slow
+# without freeing meaningful bandwidth. Classification is per rule (:meth:`assign_rule`)
+# and is the operator's call; nothing here auto-assigns.
+#
 # Bulk exists because backups and interactive VPN use have opposite needs: a backup
 # only cares about finishing, a phone on VPN cares about latency, and at equal weight
 # the backup wins simply by always having more to send. Weights are relative and only
@@ -145,6 +163,13 @@ def side_pipes(side: str, *, reversed_dir: bool = False) -> dict[str, str]:
 
 def _our_queue_names() -> set[str]:
     return {q_name(lim, side) for lim in _LIMITERS for side in SIDES}
+
+
+def limiter_bw(limiter: dict | None) -> int | None:
+    """A limiter's configured bandwidth in Mbit/s (it only ever has one entry)."""
+    for b in (limiter or {}).get("bandwidth") or []:
+        return b.get("bw")
+    return None
 
 
 # Address types that only ever describe an uplink, used to spot secondary WANs.
@@ -230,13 +255,6 @@ class ShaperClient:
             json={"parent_id": parent_id, "id": bw_id, "bw": bw_mbit, "bwscale": "Mb"},
         )
 
-    async def _patch_queue_weight(self, parent_id: int, q_id: int, weight: int) -> None:
-        await self._request(
-            "PATCH",
-            "/api/v2/firewall/traffic_shaper/limiter/queue",
-            json={"parent_id": parent_id, "id": q_id, "weight": weight},
-        )
-
     async def _create_queue(
         self, parent_id: int, limiter: str, name: str, weight: int
     ) -> None:
@@ -252,23 +270,6 @@ class ShaperClient:
                   "aqm": "droptail", "mask": queue_mask(limiter),
                   "maskbits": QUEUE_MASKBITS, "qlimit": QUEUE_QLIMIT,
                   "weight": weight},
-        )
-
-    async def _patch_queue_shape(
-        self, parent_id: int, limiter: str, q_id: int, weight: int
-    ) -> None:
-        """Set an existing queue's weight and (re)assert its mask + qlimit.
-
-        Deployments created before per-host masking have ``mask: none`` and no
-        ``qlimit``; asserting both here repairs them in place on the next
-        ensure_scheme() instead of needing the limiters rebuilt.
-        """
-        await self._request(
-            "PATCH",
-            "/api/v2/firewall/traffic_shaper/limiter/queue",
-            json={"parent_id": parent_id, "id": q_id, "weight": weight,
-                  "mask": queue_mask(limiter), "maskbits": QUEUE_MASKBITS,
-                  "qlimit": QUEUE_QLIMIT},
         )
 
     async def delete_limiter(self, limiter_id: int) -> None:
@@ -386,52 +387,176 @@ class ShaperClient:
             "bandwidth": [{"bw": bw_mbit, "bwscale": "Mb", "bwsched": "none"}],
         }
 
+    @staticmethod
+    def _weight_map(lan_weight: int, wg_weight: int) -> dict[str, int]:
+        # The ratio dial governs lan-vs-wg only; bulk always keeps BULK_WEIGHT.
+        return {SIDE_LAN: lan_weight, SIDE_WG: wg_weight, SIDE_BULK: BULK_WEIGHT}
+
+    @staticmethod
+    def _queues_match(limiter: dict, weights: dict[str, int]) -> bool:
+        """Whether a live limiter's queues already have the shape we want.
+
+        Checked before rebuilding so an unchanged ratio doesn't tear the shaper
+        down for nothing. Mask/maskbits/qlimit are part of the comparison because
+        they are equally un-patchable, so a limiter predating per-host masking has
+        to be rebuilt too, not "repaired" in place.
+        """
+        name = limiter.get("name")
+        by_name = {q.get("name"): q for q in limiter.get("queue") or []}
+        for side, weight in weights.items():
+            q = by_name.get(q_name(name, side))
+            if q is None:
+                return False
+            if (int(q.get("weight") or 0) != weight
+                    or q.get("mask") != queue_mask(name)
+                    or int(q.get("maskbits") or 0) != QUEUE_MASKBITS
+                    or int(q.get("qlimit") or 0) != QUEUE_QLIMIT):
+                return False
+        return True
+
+    async def _create_scheme(
+        self, *, down_mbit: int, up_mbit: int, weights: dict[str, int]
+    ) -> None:
+        """Create both limiters and their queues from nothing."""
+        for name, bw in ((LIMITER_DOWN, down_mbit), (LIMITER_UP, up_mbit)):
+            await self._create_limiter(self._limiter_payload(name, bw))
+            lim = await self.get_limiter(name) or {}
+            for side, weight in weights.items():
+                await self._create_queue(lim["id"], name, q_name(name, side), weight)
+
     async def ensure_scheme(
         self, *, down_mbit: int, up_mbit: int, lan_weight: int, wg_weight: int
-    ) -> None:
-        """Create the limiters if absent, else update their bandwidth + weights.
+    ) -> dict:
+        """Bring the limiters to the requested bandwidth + weights. Idempotent.
 
-        Idempotent. Creates the pipe (with bandwidth), then each queue in its own
-        POST. On an existing limiter it updates bandwidth in place, updates the
-        weight of any queue already there, and creates any queue that's missing —
-        never deleting/replacing queues (that could break rules referencing them).
+        Bandwidth is patched in place — that genuinely takes effect, even on
+        established states. Anything else about a queue can only be changed by
+        recreating the limiters, so a weight/mask difference (or a missing limiter)
+        falls through to :meth:`rebuild`. Returns that method's report.
         """
-        weights = {SIDE_LAN: lan_weight, SIDE_WG: wg_weight, SIDE_BULK: BULK_WEIGHT}
-        for name, bw in ((LIMITER_DOWN, down_mbit), (LIMITER_UP, up_mbit)):
-            existing = await self.get_limiter(name)
-            if existing is None:
-                await self._create_limiter(self._limiter_payload(name, bw))
-                existing = await self.get_limiter(name) or {}
+        weights = self._weight_map(lan_weight, wg_weight)
+        existing = {name: await self.get_limiter(name) for name in _LIMITERS}
+        if all(lim is not None for lim in existing.values()):
+            for name, bw in ((LIMITER_DOWN, down_mbit), (LIMITER_UP, up_mbit)):
+                lim = existing[name]
+                for bwobj in lim.get("bandwidth") or []:
+                    await self._patch_bandwidth(lim["id"], bwobj["id"], bw)
+            if all(self._queues_match(lim, weights) for lim in existing.values()):
+                return {"rebuilt": False, "repaired": 0, "lost": []}
+        return await self.rebuild(
+            down_mbit=down_mbit, up_mbit=up_mbit,
+            lan_weight=lan_weight, wg_weight=wg_weight,
+        )
 
-            parent_id = existing["id"]
-            for bwobj in existing.get("bandwidth") or []:
-                await self._patch_bandwidth(parent_id, bwobj["id"], bw)
+    async def set_ratio(self, *, lan_weight: int, wg_weight: int) -> dict:
+        """Change the lan-vs-wg split on the existing limiters.
 
-            by_name = {q.get("name"): q for q in existing.get("queue") or []}
-            for side, weight in weights.items():
-                qn = q_name(name, side)
-                q = by_name.get(qn)
-                if q is None:
-                    await self._create_queue(parent_id, name, qn, weight)
-                else:
-                    await self._patch_queue_shape(parent_id, name, q["id"], weight)
+        Carries the live bandwidth over, so the dial only moves the ratio. A ratio
+        that is already in force is a no-op rather than a pointless rebuild.
+        """
+        limiters = {}
+        for name in _LIMITERS:
+            lim = await self.get_limiter(name)
+            if lim is None:
+                raise PfSenseAPIError("Traffic shaping is not set up yet.")
+            limiters[name] = lim
+        weights = self._weight_map(lan_weight, wg_weight)
+        if all(self._queues_match(lim, weights) for lim in limiters.values()):
+            return {"rebuilt": False, "repaired": 0, "lost": []}
+        return await self.rebuild(
+            down_mbit=limiter_bw(limiters[LIMITER_DOWN]),
+            up_mbit=limiter_bw(limiters[LIMITER_UP]),
+            lan_weight=lan_weight, wg_weight=wg_weight,
+        )
 
-    async def set_ratio(self, *, lan_weight: int, wg_weight: int) -> None:
-        """Update only the queue weights on the existing limiters."""
+    async def rebuild(
+        self, *, down_mbit: int, up_mbit: int, lan_weight: int, wg_weight: int
+    ) -> dict:
+        """Delete and recreate the limiters, which is the only way new weights land.
+
+        See the warning in the module docstring: patching a queue's weight/mask is
+        accepted and reported back but never reaches dummynet.
+
+        Rules are deliberately NOT detached first. pfSense stores the queue *name* on
+        the rule and deleting a limiter does not cascade to them, so recreating under
+        the same names leaves every attachment intact (verified against REST v2 with
+        33 shaped rules). That is not just tidiness — a rule PATCH costs several
+        seconds on this API, so detaching and re-attaching 33 rules would take minutes
+        and outrun any sane request timeout, while swapping the limiters alone is
+        quick. Shaping also keeps running off the old ruleset until the apply, rather
+        than falling open for the length of the rebuild.
+
+        The snapshot is still taken and checked afterwards, so a pfSense version that
+        ever does clear those references gets repaired instead of silently leaving the
+        traffic unshaped.
+        """
+        sides = await self._rule_sides()
+        # Both deletes before either create: the names are unique, so recreating
+        # wgweb_up while the old one still exists would be rejected.
         for name in _LIMITERS:
             lim = await self.get_limiter(name)
             if lim is not None:
-                await self._apply_weights(lim, lan_weight, wg_weight)
+                await self.delete_limiter(lim["id"])
+        await self._create_scheme(
+            down_mbit=down_mbit, up_mbit=up_mbit,
+            weights=self._weight_map(lan_weight, wg_weight),
+        )
+        await self.apply()
+        repaired, lost = await self._restore_rule_sides(sides)
+        return {"rebuilt": True, "repaired": repaired, "lost": lost}
 
-    async def _apply_weights(self, limiter: dict, lan_weight: int, wg_weight: int) -> None:
-        # The ratio dial governs lan-vs-wg only; the bulk queue keeps BULK_WEIGHT and
-        # is deliberately left untouched here.
-        parent_id = limiter["id"]
-        for q in limiter.get("queue") or []:
-            if q.get("name", "").endswith(f"_{SIDE_LAN}"):
-                await self._patch_queue_weight(parent_id, q["id"], lan_weight)
-            elif q.get("name", "").endswith(f"_{SIDE_WG}"):
-                await self._patch_queue_weight(parent_id, q["id"], wg_weight)
+    @staticmethod
+    def _side_of(rule: dict) -> str | None:
+        """Which of our classes a rule is attached to, if any."""
+        dn, pdn = rule.get("dnpipe") or "", rule.get("pdnpipe") or ""
+        for side in SIDES:
+            names = {q_name(lim, side) for lim in _LIMITERS}
+            if dn in names or pdn in names:
+                return side
+        return None
+
+    async def _rule_sides(self) -> dict[int, str]:
+        """Snapshot of rule id -> class for every rule carrying our queues."""
+        return {
+            r["id"]: side
+            for r in await self.list_rules()
+            if r.get("id") is not None and (side := self._side_of(r)) is not None
+        }
+
+    async def _restore_rule_sides(self, sides: dict[int, str]) -> tuple[int, list[int]]:
+        """Re-attach any rule from a :meth:`_rule_sides` snapshot that lost its class.
+
+        Normally a no-op after :meth:`rebuild` — the whole point of not detaching is
+        that the attachments survive — so this only pays for the rules that actually
+        drifted. Rules that no longer exist at all are reported rather than silently
+        dropped. Returns (repaired, missing ids).
+        """
+        rules = {r.get("id"): r for r in await self.list_rules()} if sides else {}
+        stale = {
+            rule_id: side
+            for rule_id, side in sides.items()
+            if rule_id not in rules or self._side_of(rules[rule_id]) != side
+        }
+        if not stale:
+            return 0, []
+        logger.warning("rebuild lost %d rule attachment(s); repairing", len(stale))
+        reversed_ids = await self.reversed_iface_ids()
+        repaired, lost = 0, []
+        for rule_id, side in stale.items():
+            rule = rules.get(rule_id)
+            if rule is None:
+                lost.append(rule_id)
+                continue
+            rev = self._rule_is_reversed(rule, reversed_ids)
+            await self.patch_rule(
+                rule_id,
+                rule_type=rule.get("type"),
+                **side_pipes(side, reversed_dir=rev),
+            )
+            repaired += 1
+        if repaired:
+            await self.apply()
+        return repaired, lost
 
     async def assign_rule(self, rule_id: int, side: str) -> None:
         """Point one rule's pipes at a side's queues ("lan"/"wg"), or clear ("none").
@@ -473,17 +598,11 @@ class ShaperClient:
         Keeps each rule's existing side; only the In/Out assignment can change.
         Returns the rules that were actually changed.
         """
-        ours_by_side = {
-            s: {q_name(lim, s) for lim in _LIMITERS} for s in SIDES
-        }
         reversed_ids = await self.reversed_iface_ids()
         changed = []
         for rule in await self.list_rules():
             dn, pdn = rule.get("dnpipe") or "", rule.get("pdnpipe") or ""
-            side = next(
-                (s for s, names in ours_by_side.items() if dn in names or pdn in names),
-                None,
-            )
+            side = self._side_of(rule)
             if side is None:
                 continue
             want = side_pipes(side, reversed_dir=self._rule_is_reversed(rule, reversed_ids))
@@ -530,12 +649,6 @@ class ShaperClient:
                     out["wg"] = q.get("weight")
             return out
 
-        def _bw(lim: dict | None) -> int | None:
-            for b in (lim or {}).get("bandwidth") or []:
-                return b.get("bw")
-            return None
-
-        ours_by_side = {s: {q_name(lim, s) for lim in _LIMITERS} for s in SIDES}
         # Friendly names for interface tokens (physical); groups keep their raw name.
         ifaces = await self.list_interfaces()
         descr = {i.get("id"): i.get("descr") for i in ifaces}
@@ -555,10 +668,7 @@ class ShaperClient:
             if (r.get("type") or "pass") != "pass" or r.get("floating"):
                 continue
             dn, pdn = r.get("dnpipe") or "", r.get("pdnpipe") or ""
-            side = next(
-                (s for s, names in ours_by_side.items() if dn in names or pdn in names),
-                None,
-            )
+            side = self._side_of(r)
             ifs = self._rule_ifaces(r)
             rev = self._rule_is_reversed(r, reversed_ids)
             # Shaped rules whose pipes don't match their interface orientation are
@@ -591,12 +701,12 @@ class ShaperClient:
             "configured": configured,
             "down": {
                 "enabled": (down or {}).get("enabled"),
-                "bw_mbit": _bw(down),
+                "bw_mbit": limiter_bw(down),
                 "weights": _weights(down),
             },
             "up": {
                 "enabled": (up or {}).get("enabled"),
-                "bw_mbit": _bw(up),
+                "bw_mbit": limiter_bw(up),
                 "weights": _weights(up),
             },
             "rules": rules,

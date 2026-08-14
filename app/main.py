@@ -993,6 +993,20 @@ async def api_shaper(request: Request, _: None = Depends(require_api_auth)):
     return state
 
 
+def _rebuild_detail(report: dict) -> str:
+    """Audit fragment for a shaper change that may have rebuilt the limiters.
+
+    Weight changes only reach dummynet via a delete-and-recreate. Rule attachments are
+    expected to survive that untouched, so a non-zero `repaired` (or any `lost` id) is
+    the interesting case and worth having in the log.
+    """
+    if not report.get("rebuilt"):
+        return "rebuilt=no"
+    lost = report.get("lost") or []
+    detail = f"rebuilt=yes repaired={report.get('repaired', 0)}"
+    return detail + (f" lost={','.join(str(i) for i in lost)}" if lost else "")
+
+
 @app.post("/api/shaper/setup")
 async def api_shaper_setup(
     request: Request,
@@ -1003,7 +1017,7 @@ async def api_shaper_setup(
 ):
     sc = shaper(request)
     try:
-        await sc.ensure_scheme(
+        report = await sc.ensure_scheme(
             down_mbit=payload.down_mbit, up_mbit=payload.up_mbit,
             lan_weight=payload.lan_weight, wg_weight=payload.wg_weight,
         )
@@ -1012,8 +1026,11 @@ async def api_shaper_setup(
         raise HTTPException(502, f"pfSense API error: {e}") from e
     audit(session, request.session["user"], "shaper_setup",
           detail=f"down={payload.down_mbit}Mb up={payload.up_mbit}Mb "
-                 f"lan={payload.lan_weight} wg={payload.wg_weight}")
-    return await sc.state()
+                 f"lan={payload.lan_weight} wg={payload.wg_weight} "
+                 f"{_rebuild_detail(report)}")
+    state = await sc.state()
+    state["rebuild"] = report
+    return state
 
 
 @app.post("/api/shaper/ratio")
@@ -1026,13 +1043,18 @@ async def api_shaper_ratio(
 ):
     sc = shaper(request)
     try:
-        await sc.set_ratio(lan_weight=payload.lan_weight, wg_weight=payload.wg_weight)
+        report = await sc.set_ratio(
+            lan_weight=payload.lan_weight, wg_weight=payload.wg_weight
+        )
         await sc.apply()
     except PfSenseAPIError as e:
         raise HTTPException(502, f"pfSense API error: {e}") from e
     audit(session, request.session["user"], "shaper_ratio",
-          detail=f"lan={payload.lan_weight} wg={payload.wg_weight}")
-    return await sc.state()
+          detail=f"lan={payload.lan_weight} wg={payload.wg_weight} "
+                 f"{_rebuild_detail(report)}")
+    state = await sc.state()
+    state["rebuild"] = report
+    return state
 
 
 @app.post("/api/shaper/rule")
